@@ -24,9 +24,11 @@ jobs:
           submodules: recursive
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: nightly
+        shell: bash
+        run: |
+          curl -L https://foundry.paradigm.xyz | bash
+          "$HOME/.config/.foundry/bin/foundryup"
+          echo "$HOME/.config/.foundry/bin" >> "$GITHUB_PATH"
 
       - name: Show Forge version
         run: forge --version
