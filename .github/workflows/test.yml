@@ -23,7 +23,7 @@ jobs:
           submodules: recursive
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@master
 
       - name: Show Forge version
         run: forge --version
