@@ -4,9 +4,11 @@ pragma solidity ^0.8.24;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import {IInvoiceFinancingPool} from "../interfaces/IInvoiceFinancingPool.sol";
 import {IInvoiceNFT} from "../interfaces/IInvoiceNFT.sol";
-import {SeniorPool} from "../pools/SeniorPool.sol";
+import {IRWARiskManager} from "../interfaces/IRWARiskManager.sol";
 import {JuniorPool} from "../pools/JuniorPool.sol";
+import {SeniorPool} from "../pools/SeniorPool.sol";
 
 /// @title InvoiceFinancingPool
 /// @notice Protocol-level coordinator for senior/junior ERC-4626 invoice financing pools.
@@ -32,28 +34,32 @@ import {JuniorPool} from "../pools/JuniorPool.sol";
 /// - oracle settlement adapter
 /// - paid-path settlement waterfall
 /// - default-path loss waterfall
-contract InvoiceFinancingPool {
+contract InvoiceFinancingPool is IInvoiceFinancingPool {
     using SafeERC20 for IERC20;
 
     error ZeroAddress();
     error ZeroAssets();
     error InvalidFundingShares();
-
-    event SeniorDeposited(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
-    event JuniorDeposited(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
-    event SeniorWithdrawn(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
-    event JuniorWithdrawn(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
+    error InvoiceNotEligible(uint256 invoiceId);
+    error InvoiceAlreadyFinanced(uint256 invoiceId);
+    error UnauthorizedFinancer(uint256 invoiceId, address caller);
+    error BuyerConcentrationExceeded(uint256 invoiceId, address buyer, uint256 principal);
+    error InsufficientSeniorLiquidity();
+    error InsufficientJuniorLiquidity();
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     IERC20 public immutable ASSET;
     IInvoiceNFT public immutable INVOICE_NFT;
+    IRWARiskManager public immutable RISK_MANAGER;
 
     SeniorPool public immutable SENIOR_POOL;
     JuniorPool public immutable JUNIOR_POOL;
 
     uint256 public immutable SENIOR_FUNDING_SHARE_BPS;
     uint256 public immutable JUNIOR_FUNDING_SHARE_BPS;
+
+    mapping(uint256 invoiceId => FinancingPosition position) public financingPositions;
 
     /// @notice Aggregate assets locked across both tranches.
     /// @dev
@@ -70,10 +76,12 @@ contract InvoiceFinancingPool {
     constructor(
         IERC20 asset_,
         IInvoiceNFT invoiceNft_,
+        IRWARiskManager riskManager_,
         uint256 seniorFundingShareBps_,
         uint256 juniorFundingShareBps_
     ) {
-        if (address(asset_) == address(0) || address(invoiceNft_) == address(0)) {
+        if (address(asset_) == address(0) || address(invoiceNft_) == address(0) || address(riskManager_) == address(0))
+        {
             revert ZeroAddress();
         }
 
@@ -83,12 +91,100 @@ contract InvoiceFinancingPool {
 
         ASSET = asset_;
         INVOICE_NFT = invoiceNft_;
+        RISK_MANAGER = riskManager_;
 
         SENIOR_FUNDING_SHARE_BPS = seniorFundingShareBps_;
         JUNIOR_FUNDING_SHARE_BPS = juniorFundingShareBps_;
 
         SENIOR_POOL = new SeniorPool(asset_, address(this));
         JUNIOR_POOL = new JuniorPool(asset_, address(this));
+    }
+
+    /// @notice Finances a verified eligible invoice by locking senior and junior liquidity and advancing capital to the supplier.
+    /// @dev
+    /// This function performs the core transition from verified receivable to funded financing position.
+    ///
+    /// v1 execution authority:
+    /// - Originator creates the invoice.
+    /// - Verifier verifies the invoice.
+    /// - Supplier requests financing.
+    /// - Pool executes accounting and funding.
+    ///
+    /// Reverts with UnauthorizedFinancer if anyone other than the invoice supplier attempts to finance it.
+    /// Reverts with BuyerConcentrationExceeded when the invoice is otherwise eligible but the buyer exposure limit would be exceeded.
+    ///
+    /// It does not execute settlement, default resolution, fee distribution, or loss waterfall logic.
+    function financeInvoice(uint256 invoiceId) external {
+        IInvoiceNFT.Invoice memory invoice = INVOICE_NFT.getInvoice(invoiceId);
+
+        if (msg.sender != invoice.supplier) {
+            revert UnauthorizedFinancer(invoiceId, msg.sender);
+        }
+
+        if (financingPositions[invoiceId].fundedAt != 0) {
+            revert InvoiceAlreadyFinanced(invoiceId);
+        }
+
+        if (!RISK_MANAGER.isEligible(invoiceId)) {
+            revert InvoiceNotEligible(invoiceId);
+        }
+
+        uint256 principal = RISK_MANAGER.calculateAdvance(invoice.faceValue);
+
+        if (!RISK_MANAGER.checkConcentration(invoice.buyer, principal)) {
+            revert BuyerConcentrationExceeded(invoiceId, invoice.buyer, principal);
+        }
+
+        // Any rounding remainder is allocated to the junior tranche.
+        // This keeps senior funding bounded by its configured share and preserves principal conservation.
+        uint256 seniorPrincipal = principal * SENIOR_FUNDING_SHARE_BPS / BPS_DENOMINATOR;
+        uint256 juniorPrincipal = principal - seniorPrincipal;
+
+        if (SENIOR_POOL.availableLiquidity() < seniorPrincipal) {
+            revert InsufficientSeniorLiquidity();
+        }
+
+        if (JUNIOR_POOL.availableLiquidity() < juniorPrincipal) {
+            revert InsufficientJuniorLiquidity();
+        }
+
+        uint256 fundedAt = block.timestamp;
+
+        financingPositions[invoiceId] = FinancingPosition({
+            supplier: invoice.supplier,
+            buyer: invoice.buyer,
+            principal: principal,
+            seniorPrincipal: seniorPrincipal,
+            juniorPrincipal: juniorPrincipal,
+            fundedAt: fundedAt,
+            dueDate: invoice.dueDate
+        });
+
+        totalLockedAssets += principal;
+
+        // Locking and funding are intentionally separate:
+        // lockAssets() commits tranche NAV to the financing position,
+        // fundInvoice() performs the external cash movement after protocol state is recorded.
+        SENIOR_POOL.lockAssets(seniorPrincipal);
+        JUNIOR_POOL.lockAssets(juniorPrincipal);
+
+        RISK_MANAGER.updateBuyerExposure(invoice.buyer, principal, true);
+
+        INVOICE_NFT.markFunded(invoiceId);
+
+        SENIOR_POOL.fundInvoice(invoice.supplier, seniorPrincipal);
+        JUNIOR_POOL.fundInvoice(invoice.supplier, juniorPrincipal);
+
+        emit InvoiceFinanced(
+            invoiceId,
+            invoice.supplier,
+            invoice.buyer,
+            principal,
+            seniorPrincipal,
+            juniorPrincipal,
+            fundedAt,
+            invoice.dueDate
+        );
     }
 
     /// @notice Deposits assets into the SeniorPool and mints senior ERC-4626 shares to msg.sender.
