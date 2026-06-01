@@ -37,7 +37,6 @@ import {SeniorPool} from "../pools/SeniorPool.sol";
 contract InvoiceFinancingPool is IInvoiceFinancingPool {
     using SafeERC20 for IERC20;
 
-    error ZeroAddress();
     error ZeroAssets();
     error InvalidFundingShares();
     error InvoiceNotEligible(uint256 invoiceId);
@@ -46,6 +45,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     error BuyerConcentrationExceeded(uint256 invoiceId, address buyer, uint256 principal);
     error InsufficientSeniorLiquidity();
     error InsufficientJuniorLiquidity();
+    error UnauthorizedAdmin(address caller);
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
@@ -53,11 +53,23 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     IInvoiceNFT public immutable INVOICE_NFT;
     IRWARiskManager public immutable RISK_MANAGER;
 
+    address public immutable ADMIN;
+
     SeniorPool public immutable SENIOR_POOL;
     JuniorPool public immutable JUNIOR_POOL;
 
     uint256 public immutable SENIOR_FUNDING_SHARE_BPS;
     uint256 public immutable JUNIOR_FUNDING_SHARE_BPS;
+
+    /// @notice Address authorized to deliver finalized invoice outcome callbacks.
+    /// @dev Set once by the pool admin. Used to authorize onStatusFinalized().
+    address public invoiceStatusOracle;
+
+    /// @notice Finalized oracle outcome recorded for each invoice.
+    /// @dev
+    /// Default enum value is CREATED, but only SETTLED and DEFAULTED represent
+    /// valid finalized oracle outcomes in v1.
+    mapping(uint256 invoiceId => IInvoiceNFT.InvoiceStatus status) public finalizedOracleStatus;
 
     mapping(uint256 invoiceId => FinancingPosition position) public financingPositions;
 
@@ -92,12 +104,87 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         ASSET = asset_;
         INVOICE_NFT = invoiceNft_;
         RISK_MANAGER = riskManager_;
+        ADMIN = msg.sender;
 
         SENIOR_FUNDING_SHARE_BPS = seniorFundingShareBps_;
         JUNIOR_FUNDING_SHARE_BPS = juniorFundingShareBps_;
 
         SENIOR_POOL = new SeniorPool(asset_, address(this));
         JUNIOR_POOL = new JuniorPool(asset_, address(this));
+    }
+
+    modifier onlyAdmin() {
+        _onlyAdmin();
+        _;
+    }
+
+    function _onlyAdmin() internal view {
+        if (msg.sender != ADMIN) {
+            revert UnauthorizedAdmin(msg.sender);
+        }
+    }
+
+    /// @notice Sets the invoice status oracle used for finalized status callbacks.
+    /// @dev
+    /// This is intentionally set once to avoid silently changing the source of off-chain truth.
+    /// The oracle reports finalized invoice outcomes, while this pool remains responsible
+    /// for settlement/default accounting.
+    /// @param oracle Address of the InvoiceStatusOracle contract.
+    function setInvoiceStatusOracle(address oracle) external onlyAdmin {
+        if (oracle == address(0)) {
+            revert ZeroAddress();
+        }
+
+        if (invoiceStatusOracle != address(0)) {
+            revert OracleAlreadySet();
+        }
+
+        invoiceStatusOracle = oracle;
+
+        emit InvoiceStatusOracleSet(oracle);
+    }
+
+    /// @notice Receives finalized invoice outcome from the configured oracle.
+    /// @dev
+    /// Callable only by the configured InvoiceStatusOracle.
+    /// This function only records the finalized oracle status.
+    /// It does not execute settlement/default accounting and does not mutate InvoiceNFT.
+    /// The pool repeats status validation intentionally as defense-in-depth.
+    /// @param invoiceId Invoice identifier.
+    /// @param status Finalized oracle outcome.
+    function onStatusFinalized(uint256 invoiceId, IInvoiceNFT.InvoiceStatus status) external {
+        if (invoiceStatusOracle == address(0)) {
+            revert OracleNotSet();
+        }
+
+        if (msg.sender != invoiceStatusOracle) {
+            revert UnauthorizedOracle(msg.sender);
+        }
+
+        if (!_isAllowedFinalizedOracleStatus(status)) {
+            revert InvalidOracleStatus(status);
+        }
+
+        IInvoiceNFT.InvoiceStatus currentStatus = finalizedOracleStatus[invoiceId];
+
+        if (currentStatus == IInvoiceNFT.InvoiceStatus.SETTLED || currentStatus == IInvoiceNFT.InvoiceStatus.DEFAULTED)
+        {
+            revert OracleStatusAlreadyFinalized(invoiceId);
+        }
+
+        finalizedOracleStatus[invoiceId] = status;
+
+        emit OracleStatusFinalized(invoiceId, status);
+    }
+
+    /// @notice Returns whether an invoice has a finalized oracle outcome.
+    /// @dev
+    /// Only SETTLED and DEFAULTED are valid finalized oracle outcomes in v1.
+    /// The default enum value CREATED must not be interpreted as finalized.
+    /// @param invoiceId Invoice identifier.
+    /// @return finalized True if the oracle finalized SETTLED or DEFAULTED.
+    function isOracleStatusFinalized(uint256 invoiceId) external view returns (bool finalized) {
+        return _isAllowedFinalizedOracleStatus(finalizedOracleStatus[invoiceId]);
     }
 
     /// @notice Finances a verified eligible invoice by locking senior and junior liquidity and advancing capital to the supplier.
@@ -114,6 +201,9 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// Reverts with BuyerConcentrationExceeded when the invoice is otherwise eligible but the buyer exposure limit would be exceeded.
     ///
     /// It does not execute settlement, default resolution, fee distribution, or loss waterfall logic.
+    /// The financing fee is calculated after eligibility checks and stored at funding time,
+    /// Eligibility requires dueDate > block.timestamp, so valid funded positions should not
+    /// receive a zero fee due to expired invoice maturity.
     function financeInvoice(uint256 invoiceId) external {
         IInvoiceNFT.Invoice memory invoice = INVOICE_NFT.getInvoice(invoiceId);
 
@@ -149,6 +239,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         }
 
         uint256 fundedAt = block.timestamp;
+        uint256 financingFee = RISK_MANAGER.calculateFee(principal, fundedAt, invoice.dueDate);
 
         financingPositions[invoiceId] = FinancingPosition({
             supplier: invoice.supplier,
@@ -156,6 +247,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             principal: principal,
             seniorPrincipal: seniorPrincipal,
             juniorPrincipal: juniorPrincipal,
+            financingFee: financingFee,
             fundedAt: fundedAt,
             dueDate: invoice.dueDate
         });
@@ -182,6 +274,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             principal,
             seniorPrincipal,
             juniorPrincipal,
+            financingFee,
             fundedAt,
             invoice.dueDate
         );
@@ -332,5 +425,10 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// @notice Returns aggregate tranche NAV across SeniorPool and JuniorPool.
     function totalPoolAssets() external view returns (uint256) {
         return SENIOR_POOL.totalAssets() + JUNIOR_POOL.totalAssets();
+    }
+
+    /// @dev Returns true only for finalized oracle outcomes accepted by the pool.
+    function _isAllowedFinalizedOracleStatus(IInvoiceNFT.InvoiceStatus status) internal pure returns (bool) {
+        return status == IInvoiceNFT.InvoiceStatus.SETTLED || status == IInvoiceNFT.InvoiceStatus.DEFAULTED;
     }
 }
