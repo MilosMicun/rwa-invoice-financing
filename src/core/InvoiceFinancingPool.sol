@@ -15,25 +15,20 @@ import {SeniorPool} from "../pools/SeniorPool.sol";
 /// @dev
 /// InvoiceFinancingPool acts as the on-chain SPV coordinator.
 /// It does not replace SeniorPool or JuniorPool accounting.
-/// Instead, it coordinates capital entry, capital exit, and later invoice financing flows.
+/// Instead, it coordinates capital entry, capital exit, invoice financing,
+/// oracle outcome consumption, settlement accounting, and default loss recognition.
 ///
 /// LP entry and exit are intentionally permissionless in v1 to keep the portfolio
 /// implementation focused on tranche accounting, locked liquidity, and waterfall mechanics.
 /// Production RWA deployments would typically add KYC/whitelist controls around LP access.
 ///
-/// DAY 92 scope:
-/// - deploy SeniorPool and JuniorPool
-/// - expose LP deposit wrappers
-/// - expose LP withdrawal wrappers
-/// - expose liquidity and NAV views
-/// - define protocol-level accounting metrics used by later financing/default logic
-///
-/// DAY 93+ scope:
-/// - RWARiskManager integration
-/// - financeInvoice()
-/// - oracle settlement adapter
-/// - paid-path settlement waterfall
-/// - default-path loss waterfall
+/// Implementation scope:
+/// - deploys and coordinates SeniorPool and JuniorPool vaults
+/// - exposes LP deposit and withdrawal wrappers
+/// - finances eligible verified invoices
+/// - records finalized oracle outcomes
+/// - executes paid-path settlement accounting
+/// - executes default-path recovery and loss waterfalls
 contract InvoiceFinancingPool is IInvoiceFinancingPool {
     using SafeERC20 for IERC20;
 
@@ -58,8 +53,19 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     SeniorPool public immutable SENIOR_POOL;
     JuniorPool public immutable JUNIOR_POOL;
 
+    /// @notice Share of financed principal funded by the senior tranche, in basis points.
     uint256 public immutable SENIOR_FUNDING_SHARE_BPS;
+
+    /// @notice Share of financed principal funded by the junior tranche, in basis points.
     uint256 public immutable JUNIOR_FUNDING_SHARE_BPS;
+
+    /// @notice Share of realized financing fees allocated to the senior tranche, in basis points.
+    /// @dev Used only during paid-path settlement. Funding share and fee share are separate economic parameters.
+    uint256 public immutable SENIOR_FEE_SHARE_BPS;
+
+    /// @notice Share of realized financing fees allocated to the junior tranche, in basis points.
+    /// @dev Used only during paid-path settlement. Junior may receive enhanced fee participation for first-loss risk.
+    uint256 public immutable JUNIOR_FEE_SHARE_BPS;
 
     /// @notice Address authorized to deliver finalized invoice outcome callbacks.
     /// @dev Set once by the pool admin. Used to authorize onStatusFinalized().
@@ -71,18 +77,16 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// valid finalized oracle outcomes in v1.
     mapping(uint256 invoiceId => IInvoiceNFT.InvoiceStatus status) public finalizedOracleStatus;
 
+    /// @notice Per-invoice financing positions created when invoices are funded.
+    /// @dev A position remains stored after settlement/default for auditability.
     mapping(uint256 invoiceId => FinancingPosition position) public financingPositions;
 
     /// @notice Aggregate assets locked across both tranches.
-    /// @dev
-    /// DAY 92 declares this protocol-level metric, but it is first mutated when
-    /// financeInvoice(), settlement, and default flows are added in later implementation days.
+    /// @dev Increased when invoices are financed and decreased exactly once during settlement or default resolution.
     uint256 public totalLockedAssets;
 
     /// @notice Cumulative realized credit losses across the protocol.
-    /// @dev
-    /// DAY 92 declares this protocol-level metric, but it is first increased during
-    /// default resolution. It is a gross cumulative loss metric and is never reset.
+    /// @dev Gross cumulative principal loss metric. It is increased during default resolution and is never reset.
     uint256 public totalBadDebt;
 
     constructor(
@@ -90,7 +94,9 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         IInvoiceNFT invoiceNft_,
         IRWARiskManager riskManager_,
         uint256 seniorFundingShareBps_,
-        uint256 juniorFundingShareBps_
+        uint256 juniorFundingShareBps_,
+        uint256 seniorFeeShareBps_,
+        uint256 juniorFeeShareBps_
     ) {
         if (address(asset_) == address(0) || address(invoiceNft_) == address(0) || address(riskManager_) == address(0))
         {
@@ -101,6 +107,10 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             revert InvalidFundingShares();
         }
 
+        if (seniorFeeShareBps_ + juniorFeeShareBps_ != BPS_DENOMINATOR) {
+            revert InvalidFeeShares();
+        }
+
         ASSET = asset_;
         INVOICE_NFT = invoiceNft_;
         RISK_MANAGER = riskManager_;
@@ -108,6 +118,9 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
 
         SENIOR_FUNDING_SHARE_BPS = seniorFundingShareBps_;
         JUNIOR_FUNDING_SHARE_BPS = juniorFundingShareBps_;
+
+        SENIOR_FEE_SHARE_BPS = seniorFeeShareBps_;
+        JUNIOR_FEE_SHARE_BPS = juniorFeeShareBps_;
 
         SENIOR_POOL = new SeniorPool(asset_, address(this));
         JUNIOR_POOL = new JuniorPool(asset_, address(this));
@@ -191,7 +204,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// @dev
     /// This function performs the core transition from verified receivable to funded financing position.
     ///
-    /// v1 execution authority:
+    /// Execution authority:
     /// - Originator creates the invoice.
     /// - Verifier verifies the invoice.
     /// - Supplier requests financing.
@@ -200,10 +213,13 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// Reverts with UnauthorizedFinancer if anyone other than the invoice supplier attempts to finance it.
     /// Reverts with BuyerConcentrationExceeded when the invoice is otherwise eligible but the buyer exposure limit would be exceeded.
     ///
-    /// It does not execute settlement, default resolution, fee distribution, or loss waterfall logic.
-    /// The financing fee is calculated after eligibility checks and stored at funding time,
+    /// This function does not execute settlement, default resolution, fee distribution, or loss waterfall logic.
+    /// The financing fee is calculated and stored at funding time so later risk parameter changes
+    /// do not affect already active financing positions.
+    ///
     /// Eligibility requires dueDate > block.timestamp, so valid funded positions should not
     /// receive a zero fee due to expired invoice maturity.
+    /// @param invoiceId Identifier of the verified invoice to finance.
     function financeInvoice(uint256 invoiceId) external {
         IInvoiceNFT.Invoice memory invoice = INVOICE_NFT.getInvoice(invoiceId);
 
@@ -249,7 +265,8 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             juniorPrincipal: juniorPrincipal,
             financingFee: financingFee,
             fundedAt: fundedAt,
-            dueDate: invoice.dueDate
+            dueDate: invoice.dueDate,
+            resolved: false
         });
 
         totalLockedAssets += principal;
@@ -277,6 +294,246 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             financingFee,
             fundedAt,
             invoice.dueDate
+        );
+    }
+
+    /// @notice Settles a financed invoice after the oracle has finalized a paid outcome.
+    /// @dev
+    /// Consumes a finalized oracle SETTLED status and executes the paid-path waterfall
+    /// for an active financing position.
+    ///
+    /// The oracle only finalizes the off-chain repayment outcome. This pool performs
+    /// the accounting effects and marks the InvoiceNFT as SETTLED only after successful
+    /// settlement execution.
+    ///
+    /// The function is permissionless in v1: any caller may execute settlement
+    /// after oracle finalization, provided they hold approval for `paidAmount`.
+    /// This keeps settlement execution authority separate from oracle reporting authority.
+    ///
+    /// Requirements:
+    /// - The invoice must have an active financing position.
+    /// - The position must not already be resolved.
+    /// - The oracle must have finalized SETTLED for the invoice.
+    /// - The InvoiceNFT lifecycle status must still be FUNDED.
+    /// - The invoice must not be FROZEN.
+    /// - `paidAmount` must be at least principal plus stored financing fee.
+    ///
+    /// Accounting:
+    /// - Senior and junior principal cash backing is restored to the tranche vaults.
+    /// - Financing fee is split between tranches according to configured fee shares.
+    /// - Surplus above principal plus financing fee is returned to the Supplier.
+    /// - Locked assets and buyer exposure are reduced exactly once.
+    /// - The financing position is marked resolved before external calls for CEI safety.
+    ///
+    /// @param invoiceId Identifier of the financed invoice.
+    /// @param paidAmount Amount reported as paid and pulled through the settlement waterfall.
+    function settleInvoice(uint256 invoiceId, uint256 paidAmount) external {
+        FinancingPosition storage position = financingPositions[invoiceId];
+
+        if (position.fundedAt == 0) {
+            revert FinancingPositionDoesNotExist(invoiceId);
+        }
+
+        if (position.resolved) {
+            revert FinancingPositionAlreadyResolved(invoiceId);
+        }
+
+        IInvoiceNFT.InvoiceStatus oracleStatus = finalizedOracleStatus[invoiceId];
+
+        if (!_isAllowedFinalizedOracleStatus(oracleStatus)) {
+            revert OracleStatusNotFinalized(invoiceId);
+        }
+
+        if (oracleStatus != IInvoiceNFT.InvoiceStatus.SETTLED) {
+            revert UnexpectedOracleStatus(invoiceId, oracleStatus, IInvoiceNFT.InvoiceStatus.SETTLED);
+        }
+
+        IInvoiceNFT.Invoice memory invoice = INVOICE_NFT.getInvoice(invoiceId);
+
+        if (invoice.status == IInvoiceNFT.InvoiceStatus.FROZEN) {
+            revert InvoiceFrozen(invoiceId);
+        }
+
+        if (invoice.status != IInvoiceNFT.InvoiceStatus.FUNDED) {
+            revert InvoiceNotFunded(invoiceId, invoice.status);
+        }
+
+        uint256 expectedRepayment = position.principal + position.financingFee;
+
+        if (paidAmount < expectedRepayment) {
+            revert PaidAmountBelowExpected(paidAmount, expectedRepayment);
+        }
+
+        uint256 juniorFee = position.financingFee * JUNIOR_FEE_SHARE_BPS / BPS_DENOMINATOR;
+        uint256 seniorFee = position.financingFee - juniorFee;
+        uint256 surplus = paidAmount - expectedRepayment;
+        uint256 settledAt = block.timestamp;
+
+        uint256 seniorRepayment = position.seniorPrincipal + seniorFee;
+        uint256 juniorRepayment = position.juniorPrincipal + juniorFee;
+
+        // Close local accounting before external calls.
+        // If any later operation reverts, the whole transaction reverts atomically.
+        position.resolved = true;
+        totalLockedAssets -= position.principal;
+
+        if (seniorRepayment > 0) {
+            ASSET.safeTransferFrom(msg.sender, address(SENIOR_POOL), seniorRepayment);
+        }
+
+        if (juniorRepayment > 0) {
+            ASSET.safeTransferFrom(msg.sender, address(JUNIOR_POOL), juniorRepayment);
+        }
+
+        if (surplus > 0) {
+            ASSET.safeTransferFrom(msg.sender, position.supplier, surplus);
+        }
+
+        SENIOR_POOL.unlockAssets(position.seniorPrincipal);
+        JUNIOR_POOL.unlockAssets(position.juniorPrincipal);
+
+        if (seniorFee > 0) {
+            SENIOR_POOL.creditAssets(seniorFee);
+        }
+
+        if (juniorFee > 0) {
+            JUNIOR_POOL.creditAssets(juniorFee);
+        }
+
+        RISK_MANAGER.updateBuyerExposure(position.buyer, position.principal, false);
+
+        INVOICE_NFT.markSettled(invoiceId);
+
+        emit InvoiceSettled(
+            invoiceId,
+            msg.sender,
+            position.buyer,
+            paidAmount,
+            position.principal,
+            position.financingFee,
+            juniorFee,
+            seniorFee,
+            surplus,
+            settledAt
+        );
+    }
+
+    /// @notice Resolves a defaulted financed invoice after the oracle has finalized a default outcome.
+    /// @dev
+    /// Consumes a finalized oracle DEFAULTED status and executes the default-path recovery
+    /// and loss waterfall for an active financing position.
+    ///
+    /// The oracle only finalizes the off-chain default outcome. This pool performs
+    /// recovery allocation, NAV writedowns, bad debt accounting, and marks the InvoiceNFT
+    /// as DEFAULTED only after successful default execution.
+    ///
+    /// The function is permissionless in v1: any caller may execute default resolution
+    /// after oracle finalization, provided they hold approval for any declared `recoveredAmount`.
+    /// This keeps default execution authority separate from oracle reporting authority.
+    ///
+    /// Requirements:
+    /// - The invoice must have an active financing position.
+    /// - The position must not already be resolved.
+    /// - The oracle must have finalized DEFAULTED for the invoice.
+    /// - The InvoiceNFT lifecycle status must still be FUNDED.
+    /// - The invoice must not be FROZEN.
+    /// - `recoveredAmount` must not exceed financed principal.
+    ///
+    /// Accounting:
+    /// - Recovered principal is allocated to SeniorPool first, then JuniorPool.
+    /// - JuniorPool absorbs first-loss exposure through NAV writedown.
+    /// - SeniorPool absorbs only residual loss after junior recovery is depleted.
+    /// - `totalBadDebt` increases by realized principal credit loss.
+    /// - Unpaid financing fee is not counted as bad debt because it was never realized NAV.
+    /// - Locked assets and buyer exposure are reduced exactly once.
+    /// - The financing position is marked resolved before external calls for CEI safety.
+    ///
+    /// @param invoiceId Identifier of the financed invoice.
+    /// @param recoveredAmount Amount recovered against financed principal during default resolution.
+    function resolveDefault(uint256 invoiceId, uint256 recoveredAmount) external {
+        FinancingPosition storage position = financingPositions[invoiceId];
+
+        if (position.fundedAt == 0) {
+            revert FinancingPositionDoesNotExist(invoiceId);
+        }
+
+        if (position.resolved) {
+            revert FinancingPositionAlreadyResolved(invoiceId);
+        }
+
+        IInvoiceNFT.InvoiceStatus oracleStatus = finalizedOracleStatus[invoiceId];
+
+        if (!_isAllowedFinalizedOracleStatus(oracleStatus)) {
+            revert OracleStatusNotFinalized(invoiceId);
+        }
+
+        if (oracleStatus != IInvoiceNFT.InvoiceStatus.DEFAULTED) {
+            revert UnexpectedOracleStatus(invoiceId, oracleStatus, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+        }
+
+        IInvoiceNFT.Invoice memory invoice = INVOICE_NFT.getInvoice(invoiceId);
+
+        if (invoice.status == IInvoiceNFT.InvoiceStatus.FROZEN) {
+            revert InvoiceFrozen(invoiceId);
+        }
+
+        if (invoice.status != IInvoiceNFT.InvoiceStatus.FUNDED) {
+            revert InvoiceNotFunded(invoiceId, invoice.status);
+        }
+
+        if (recoveredAmount > position.principal) {
+            revert RecoveredAmountExceedsPrincipal(recoveredAmount, position.principal);
+        }
+
+        uint256 seniorRecovery = recoveredAmount > position.seniorPrincipal ? position.seniorPrincipal : recoveredAmount;
+
+        uint256 juniorRecovery = recoveredAmount - seniorRecovery;
+
+        uint256 seniorLoss = position.seniorPrincipal - seniorRecovery;
+        uint256 juniorLoss = position.juniorPrincipal - juniorRecovery;
+
+        uint256 loss = position.principal - recoveredAmount;
+
+        // Close local accounting before external calls.
+        // If any later operation reverts, the whole transaction reverts atomically.
+        position.resolved = true;
+        totalLockedAssets -= position.principal;
+        totalBadDebt += loss;
+
+        if (seniorRecovery > 0) {
+            ASSET.safeTransferFrom(msg.sender, address(SENIOR_POOL), seniorRecovery);
+        }
+
+        if (juniorRecovery > 0) {
+            ASSET.safeTransferFrom(msg.sender, address(JUNIOR_POOL), juniorRecovery);
+        }
+
+        SENIOR_POOL.unlockAssets(position.seniorPrincipal);
+        JUNIOR_POOL.unlockAssets(position.juniorPrincipal);
+
+        if (juniorLoss > 0) {
+            JUNIOR_POOL.writeDown(juniorLoss);
+        }
+
+        if (seniorLoss > 0) {
+            SENIOR_POOL.writeDown(seniorLoss);
+        }
+
+        RISK_MANAGER.updateBuyerExposure(position.buyer, position.principal, false);
+
+        INVOICE_NFT.markDefaulted(invoiceId);
+
+        emit InvoiceDefaultResolved(
+            invoiceId,
+            msg.sender,
+            position.buyer,
+            position.principal,
+            recoveredAmount,
+            seniorRecovery,
+            juniorRecovery,
+            loss,
+            juniorLoss,
+            seniorLoss
         );
     }
 
