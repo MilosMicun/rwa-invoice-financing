@@ -17,7 +17,7 @@ import {MockERC20} from "../mocks/MockERC20.sol";
 
 contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
     MockERC20 internal asset;
-    InvoiceNFT internal invoiceNFT;
+    InvoiceNFT internal invoiceNft;
     RWARiskManager internal riskManager;
     InvoiceFinancingPool internal pool;
     InvoiceStatusOracle internal oracle;
@@ -31,8 +31,8 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
     address internal supplier = makeAddr("supplier");
     address internal buyer = makeAddr("buyer");
     address internal resolver = makeAddr("resolver");
-    address internal seniorLP = makeAddr("seniorLP");
-    address internal juniorLP = makeAddr("juniorLP");
+    address internal seniorLp = makeAddr("seniorLp");
+    address internal juniorLp = makeAddr("juniorLp");
 
     uint256 internal constant BPS = 10_000;
     uint256 internal constant SENIOR_DEPOSIT = 700_000e18;
@@ -55,7 +55,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         vm.warp(1_700_000_000);
 
         asset = new MockERC20();
-        invoiceNFT = new InvoiceNFT(admin);
+        invoiceNft = new InvoiceNFT(admin);
 
         IRWARiskManager.RiskParams memory params = IRWARiskManager.RiskParams({
             maxExposurePerBuyer: MAX_EXPOSURE_PER_BUYER,
@@ -65,12 +65,12 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
             financingFeeApr: FINANCING_FEE_APR_BPS
         });
 
-        riskManager = new RWARiskManager(admin, invoiceNFT, params);
+        riskManager = new RWARiskManager(admin, invoiceNft, params);
 
         vm.prank(admin);
         pool = new InvoiceFinancingPool(
             asset,
-            invoiceNFT,
+            invoiceNft,
             riskManager,
             SENIOR_FUNDING_SHARE_BPS,
             JUNIOR_FUNDING_SHARE_BPS,
@@ -80,13 +80,13 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
 
         seniorPool = pool.SENIOR_POOL();
         juniorPool = pool.JUNIOR_POOL();
-        oracle = new InvoiceStatusOracle(admin, invoiceNFT, pool, DISPUTE_WINDOW, MAX_STALENESS);
+        oracle = new InvoiceStatusOracle(admin, invoiceNft, pool, DISPUTE_WINDOW, MAX_STALENESS);
 
         vm.startPrank(admin);
-        invoiceNFT.grantRole(invoiceNFT.ORIGINATOR_ROLE(), originator);
-        invoiceNFT.grantRole(invoiceNFT.VERIFIER_ROLE(), verifier);
-        invoiceNFT.grantRole(invoiceNFT.RISK_ROLE(), riskAdmin);
-        invoiceNFT.grantRole(invoiceNFT.POOL_ROLE(), address(pool));
+        invoiceNft.grantRole(invoiceNft.ORIGINATOR_ROLE(), originator);
+        invoiceNft.grantRole(invoiceNft.VERIFIER_ROLE(), verifier);
+        invoiceNft.grantRole(invoiceNft.RISK_ROLE(), riskAdmin);
+        invoiceNft.grantRole(invoiceNft.POOL_ROLE(), address(pool));
         riskManager.grantRole(riskManager.POOL_ROLE(), address(pool));
         pool.setInvoiceStatusOracle(address(oracle));
         vm.stopPrank();
@@ -94,29 +94,29 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
 
     function test_SetUp_DeployedCoreContractsAndLinkedPools() public view {
         assertEq(address(pool.ASSET()), address(asset));
-        assertEq(address(pool.INVOICE_NFT()), address(invoiceNFT));
+        assertEq(address(pool.INVOICE_NFT()), address(invoiceNft));
         assertEq(address(pool.RISK_MANAGER()), address(riskManager));
         assertEq(pool.ADMIN(), admin);
         assertEq(address(pool.SENIOR_POOL()), address(seniorPool));
         assertEq(address(pool.JUNIOR_POOL()), address(juniorPool));
         assertEq(pool.invoiceStatusOracle(), address(oracle));
-        assertTrue(invoiceNFT.hasRole(invoiceNFT.ORIGINATOR_ROLE(), originator));
-        assertTrue(invoiceNFT.hasRole(invoiceNFT.VERIFIER_ROLE(), verifier));
-        assertTrue(invoiceNFT.hasRole(invoiceNFT.RISK_ROLE(), riskAdmin));
-        assertTrue(invoiceNFT.hasRole(invoiceNFT.POOL_ROLE(), address(pool)));
+        assertTrue(invoiceNft.hasRole(invoiceNft.ORIGINATOR_ROLE(), originator));
+        assertTrue(invoiceNft.hasRole(invoiceNft.VERIFIER_ROLE(), verifier));
+        assertTrue(invoiceNft.hasRole(invoiceNft.RISK_ROLE(), riskAdmin));
+        assertTrue(invoiceNft.hasRole(invoiceNft.POOL_ROLE(), address(pool)));
         assertTrue(riskManager.hasRole(riskManager.POOL_ROLE(), address(pool)));
     }
 
     function _depositTranches(uint256 seniorAssets, uint256 juniorAssets) internal {
-        asset.mint(seniorLP, seniorAssets);
-        asset.mint(juniorLP, juniorAssets);
+        asset.mint(seniorLp, seniorAssets);
+        asset.mint(juniorLp, juniorAssets);
 
-        vm.startPrank(seniorLP);
+        vm.startPrank(seniorLp);
         asset.approve(address(pool), seniorAssets);
         pool.depositSenior(seniorAssets);
         vm.stopPrank();
 
-        vm.startPrank(juniorLP);
+        vm.startPrank(juniorLp);
         asset.approve(address(pool), juniorAssets);
         pool.depositJunior(juniorAssets);
         vm.stopPrank();
@@ -124,10 +124,10 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
 
     function _createVerifiedInvoice(uint256 faceValue, uint256 dueDate) internal returns (uint256 invoiceId) {
         vm.prank(originator);
-        invoiceId = invoiceNFT.createInvoice(supplier, buyer, faceValue, dueDate);
+        invoiceId = invoiceNft.createInvoice(supplier, buyer, faceValue, dueDate);
 
         vm.prank(verifier);
-        invoiceNFT.verify(invoiceId);
+        invoiceNft.verify(invoiceId);
     }
 
     function _financeAsSupplier(uint256 invoiceId) internal {
@@ -250,7 +250,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         assertEq(juniorPrincipal, expectedJuniorPrincipal);
         assertFalse(resolved);
 
-        IInvoiceNFT.Invoice memory invoice = invoiceNFT.getInvoice(invoiceId);
+        IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
         assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
     }
 
@@ -261,7 +261,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         uint256 expectedJuniorFee,
         uint256 expectedTotalFee
     ) internal view {
-        IInvoiceNFT.Invoice memory invoice = invoiceNFT.getInvoice(invoiceId);
+        IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
 
         assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.SETTLED));
         assertTrue(_getPositionResolved(invoiceId));
@@ -282,7 +282,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         uint256 expectedJuniorAssets,
         uint256 expectedBadDebt
     ) internal view {
-        IInvoiceNFT.Invoice memory invoice = invoiceNFT.getInvoice(invoiceId);
+        IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
 
         assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
         assertTrue(_getPositionResolved(invoiceId));
@@ -306,7 +306,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         uint256 principal = _expectedPrincipal();
         uint256 seniorPrincipal = _expectedSeniorPrincipal(principal);
         uint256 juniorPrincipal = _expectedJuniorPrincipal(principal, seniorPrincipal);
-        IInvoiceNFT.Invoice memory invoice = invoiceNFT.getInvoice(invoiceId);
+        IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
 
         assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
         assertEq(pool.totalLockedAssets(), principal);
@@ -339,31 +339,31 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _settleAsBuyer(invoiceId, principal + financingFee);
         _assertSettledState(invoiceId, seniorFee, juniorFee, financingFee);
 
-        uint256 seniorWithdrawAmount = seniorPool.maxWithdraw(seniorLP);
-        uint256 juniorWithdrawAmount = juniorPool.maxWithdraw(juniorLP);
+        uint256 seniorWithdrawAmount = seniorPool.maxWithdraw(seniorLp);
+        uint256 juniorWithdrawAmount = juniorPool.maxWithdraw(juniorLp);
 
         assertGt(seniorWithdrawAmount, SENIOR_DEPOSIT);
         assertGt(juniorWithdrawAmount, JUNIOR_DEPOSIT);
 
         uint256 seniorSharesToApprove = pool.previewSeniorWithdrawShares(seniorWithdrawAmount);
         uint256 juniorSharesToApprove = pool.previewJuniorWithdrawShares(juniorWithdrawAmount);
-        uint256 seniorBalanceBefore = asset.balanceOf(seniorLP);
-        uint256 juniorBalanceBefore = asset.balanceOf(juniorLP);
+        uint256 seniorBalanceBefore = asset.balanceOf(seniorLp);
+        uint256 juniorBalanceBefore = asset.balanceOf(juniorLp);
 
-        vm.startPrank(seniorLP);
+        vm.startPrank(seniorLp);
         seniorPool.approve(address(pool), seniorSharesToApprove);
         pool.withdrawSenior(seniorWithdrawAmount);
         vm.stopPrank();
 
-        vm.startPrank(juniorLP);
+        vm.startPrank(juniorLp);
         juniorPool.approve(address(pool), juniorSharesToApprove);
         pool.withdrawJunior(juniorWithdrawAmount);
         vm.stopPrank();
 
-        assertEq(asset.balanceOf(seniorLP) - seniorBalanceBefore, seniorWithdrawAmount);
-        assertEq(asset.balanceOf(juniorLP) - juniorBalanceBefore, juniorWithdrawAmount);
-        assertLe(seniorPool.balanceOf(seniorLP), 1);
-        assertLe(juniorPool.balanceOf(juniorLP), 1);
+        assertEq(asset.balanceOf(seniorLp) - seniorBalanceBefore, seniorWithdrawAmount);
+        assertEq(asset.balanceOf(juniorLp) - juniorBalanceBefore, juniorWithdrawAmount);
+        assertLe(seniorPool.balanceOf(seniorLp), 1);
+        assertLe(juniorPool.balanceOf(juniorLp), 1);
         assertLe(seniorPool.totalAssets(), 1);
         assertLe(juniorPool.totalAssets(), 1);
         assertLe(pool.totalPoolAssets(), 2);
@@ -506,7 +506,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _submitAndFinalizeOracleStatus(firstInvoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
         _resolveDefaultAsResolver(firstInvoiceId, 0);
 
-        IInvoiceNFT.Invoice memory firstInvoice = invoiceNFT.getInvoice(firstInvoiceId);
+        IInvoiceNFT.Invoice memory firstInvoice = invoiceNft.getInvoice(firstInvoiceId);
 
         assertEq(uint256(firstInvoice.status), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
         assertTrue(_getPositionResolved(firstInvoiceId));
@@ -544,7 +544,15 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
 
         uint256 secondInvoiceId = _createVerifiedInvoice(FACE_VALUE, dueDate);
 
-        vm.expectRevert(abi.encodeWithSelector(InvoiceFinancingPool.InvoiceNotEligible.selector, secondInvoiceId));
+        assertTrue(riskManager.isEligible(secondInvoiceId));
+        assertFalse(riskManager.checkConcentration(buyer, principal));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                InvoiceFinancingPool.BuyerConcentrationExceeded.selector, secondInvoiceId, buyer, principal
+            )
+        );
+
         vm.prank(supplier);
         pool.financeInvoice(secondInvoiceId);
 
@@ -565,7 +573,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         assertEq(riskManager.getBuyerExposure(buyer), 0);
         assertEq(seniorPool.lockedAssets(), 0);
         assertEq(juniorPool.lockedAssets(), 0);
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
     }
 
     function test_FinanceInvoice_Reverts_WhenAmountBelowMinimum() public {
@@ -581,7 +589,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         assertEq(riskManager.getBuyerExposure(buyer), 0);
         assertEq(seniorPool.lockedAssets(), 0);
         assertEq(juniorPool.lockedAssets(), 0);
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
     }
 
     function test_FinanceInvoice_Reverts_WhenBuyerIsDenied() public {
@@ -602,7 +610,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         assertEq(riskManager.getBuyerExposure(buyer), 0);
         assertEq(seniorPool.lockedAssets(), 0);
         assertEq(juniorPool.lockedAssets(), 0);
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
     }
 
     function test_FinanceInvoice_Reverts_WhenInvoiceAlreadyFinanced() public {
@@ -623,7 +631,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         assertEq(riskManager.getBuyerExposure(buyer), principal);
         assertEq(seniorPool.lockedAssets(), seniorPrincipal);
         assertEq(juniorPool.lockedAssets(), juniorPrincipal);
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
         assertFalse(_getPositionResolved(invoiceId));
     }
 
@@ -645,7 +653,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         oracle.finalize(invoiceId);
 
         assertFalse(pool.isOracleStatusFinalized(invoiceId));
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
         assertFalse(_getPositionResolved(invoiceId));
         assertEq(pool.totalLockedAssets(), _expectedPrincipal());
         assertEq(riskManager.getBuyerExposure(buyer), _expectedPrincipal());
@@ -673,7 +681,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         assertTrue(update.disputed);
         assertFalse(update.finalized);
         assertFalse(pool.isOracleStatusFinalized(invoiceId));
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
         assertFalse(_getPositionResolved(invoiceId));
         assertEq(pool.totalLockedAssets(), _expectedPrincipal());
         assertEq(riskManager.getBuyerExposure(buyer), _expectedPrincipal());
@@ -685,9 +693,9 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         uint256 invoiceId = _createVerifiedInvoice(FACE_VALUE, block.timestamp + INVOICE_TENOR);
 
         vm.prank(riskAdmin);
-        invoiceNFT.freezeInvoice(invoiceId);
+        invoiceNft.freezeInvoice(invoiceId);
 
-        IInvoiceNFT.Invoice memory frozenInvoice = invoiceNFT.getInvoice(invoiceId);
+        IInvoiceNFT.Invoice memory frozenInvoice = invoiceNft.getInvoice(invoiceId);
         assertEq(uint256(frozenInvoice.status), uint256(IInvoiceNFT.InvoiceStatus.FROZEN));
         assertEq(uint256(frozenInvoice.previousStatus), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
 
@@ -716,7 +724,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
 
         vm.prank(riskAdmin);
-        invoiceNFT.freezeInvoice(invoiceId);
+        invoiceNft.freezeInvoice(invoiceId);
 
         asset.mint(buyer, expectedRepayment);
 
@@ -749,7 +757,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
 
         vm.prank(riskAdmin);
-        invoiceNFT.freezeInvoice(invoiceId);
+        invoiceNft.freezeInvoice(invoiceId);
 
         asset.mint(resolver, recoveredAmount);
 
@@ -784,7 +792,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
 
         vm.prank(riskAdmin);
-        invoiceNFT.freezeInvoice(invoiceId);
+        invoiceNft.freezeInvoice(invoiceId);
 
         asset.mint(buyer, expectedRepayment);
 
@@ -795,9 +803,9 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         vm.stopPrank();
 
         vm.prank(riskAdmin);
-        invoiceNFT.unfreezeInvoice(invoiceId);
+        invoiceNft.unfreezeInvoice(invoiceId);
 
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
 
         // The approval was set in a separate successful call and remains valid.
         // The reverted settlement transferred no tokens and consumed no allowance.
@@ -821,7 +829,7 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
 
         vm.prank(riskAdmin);
-        invoiceNFT.freezeInvoice(invoiceId);
+        invoiceNft.freezeInvoice(invoiceId);
 
         asset.mint(resolver, recoveredAmount);
 
@@ -832,9 +840,9 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         vm.stopPrank();
 
         vm.prank(riskAdmin);
-        invoiceNFT.unfreezeInvoice(invoiceId);
+        invoiceNft.unfreezeInvoice(invoiceId);
 
-        assertEq(uint256(invoiceNFT.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
 
         // The approval remains valid because the reverted resolution transferred
         // no recovery tokens and consumed no allowance.

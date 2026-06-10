@@ -56,9 +56,10 @@ interface IRWARiskManager {
     /// @param buyer Buyer address to check.
     function isBuyerDenied(address buyer) external view returns (bool);
 
-    /// @notice Returns whether an invoice is currently eligible for financing.
+    /// @notice Returns whether an invoice satisfies intrinsic underwriting eligibility.
     /// @dev
-    /// Implementations should treat this as a boolean risk query.
+    /// This check excludes mutable portfolio concentration, which must be checked
+    /// separately and atomically by InvoiceFinancingPool before funding.
     /// A non-existent invoice should return false rather than bubbling up a registry revert.
     /// @param invoiceId Invoice identifier in the InvoiceNFT registry.
     function isEligible(uint256 invoiceId) external view returns (bool);

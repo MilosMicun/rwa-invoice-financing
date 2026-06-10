@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Test} from "forge-std/Test.sol";
+
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+
+import {InvoiceNFT} from "../../src/core/InvoiceNFT.sol";
+import {InvoiceStatusOracle} from "../../src/oracle/InvoiceStatusOracle.sol";
+import {IInvoiceNFT} from "../../src/interfaces/IInvoiceNFT.sol";
+import {IInvoiceFinancingPool} from "../../src/interfaces/IInvoiceFinancingPool.sol";
+import {IInvoiceStatusOracle} from "../../src/interfaces/IInvoiceStatusOracle.sol";
+import {MockInvoiceFinancingPool} from "../mocks/MockInvoiceFinancingPool.sol";
+
+contract InvoiceStatusOracleTest is Test {
+    InvoiceNFT internal invoiceNft;
+    InvoiceStatusOracle internal oracle;
+    MockInvoiceFinancingPool internal mockPool;
+
+    address internal admin = makeAddr("admin");
+    address internal originator = makeAddr("originator");
+    address internal verifier = makeAddr("verifier");
+    address internal poolOperator = makeAddr("poolOperator");
+    address internal supplier = makeAddr("supplier");
+    address internal buyer = makeAddr("buyer");
+    address internal finalizer = makeAddr("finalizer");
+    address internal unauthorizedCaller = makeAddr("unauthorizedCaller");
+
+    uint256 internal constant FACE_VALUE = 100_000e18;
+    uint256 internal constant INVOICE_TENOR = 30 days;
+    uint256 internal constant DISPUTE_WINDOW = 1 days;
+    uint256 internal constant MAX_STALENESS = 7 days;
+
+    function setUp() public {
+        vm.warp(1_700_000_000);
+
+        invoiceNft = new InvoiceNFT(admin);
+        mockPool = new MockInvoiceFinancingPool();
+
+        oracle = new InvoiceStatusOracle(
+            admin, invoiceNft, IInvoiceFinancingPool(address(mockPool)), DISPUTE_WINDOW, MAX_STALENESS
+        );
+
+        vm.startPrank(admin);
+        invoiceNft.grantRole(invoiceNft.ORIGINATOR_ROLE(), originator);
+        invoiceNft.grantRole(invoiceNft.VERIFIER_ROLE(), verifier);
+        invoiceNft.grantRole(invoiceNft.POOL_ROLE(), poolOperator);
+        vm.stopPrank();
+    }
+
+    function _createInvoice() internal returns (uint256 invoiceId) {
+        vm.prank(originator);
+        invoiceId = invoiceNft.createInvoice(supplier, buyer, FACE_VALUE, block.timestamp + INVOICE_TENOR);
+    }
+
+    function _createVerifiedInvoice() internal returns (uint256 invoiceId) {
+        invoiceId = _createInvoice();
+
+        vm.prank(verifier);
+        invoiceNft.verify(invoiceId);
+    }
+
+    function _createFundedInvoice() internal returns (uint256 invoiceId) {
+        invoiceId = _createVerifiedInvoice();
+
+        vm.prank(poolOperator);
+        invoiceNft.markFunded(invoiceId);
+    }
+
+    function _submitStatus(uint256 invoiceId, IInvoiceNFT.InvoiceStatus status) internal {
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, status);
+    }
+
+    function test_Constructor_Reverts_WhenAdminIsZeroAddress() public {
+        vm.expectRevert(IInvoiceStatusOracle.ZeroAddress.selector);
+
+        new InvoiceStatusOracle(
+            address(0), invoiceNft, IInvoiceFinancingPool(address(mockPool)), DISPUTE_WINDOW, MAX_STALENESS
+        );
+    }
+
+    function test_Constructor_Reverts_WhenInvoiceNFTIsZeroAddress() public {
+        vm.expectRevert(IInvoiceStatusOracle.ZeroAddress.selector);
+
+        new InvoiceStatusOracle(
+            admin, IInvoiceNFT(address(0)), IInvoiceFinancingPool(address(mockPool)), DISPUTE_WINDOW, MAX_STALENESS
+        );
+    }
+
+    function test_Constructor_Reverts_WhenPoolIsZeroAddress() public {
+        vm.expectRevert(IInvoiceStatusOracle.ZeroAddress.selector);
+
+        new InvoiceStatusOracle(admin, invoiceNft, IInvoiceFinancingPool(address(0)), DISPUTE_WINDOW, MAX_STALENESS);
+    }
+
+    function test_Constructor_Reverts_WhenDisputeWindowIsZero() public {
+        vm.expectRevert(IInvoiceStatusOracle.InvalidDisputeWindow.selector);
+
+        new InvoiceStatusOracle(admin, invoiceNft, IInvoiceFinancingPool(address(mockPool)), 0, MAX_STALENESS);
+    }
+
+    function test_Constructor_Reverts_WhenMaxStalenessEqualsDisputeWindow() public {
+        vm.expectRevert(IInvoiceStatusOracle.InvalidMaxStaleness.selector);
+
+        new InvoiceStatusOracle(
+            admin, invoiceNft, IInvoiceFinancingPool(address(mockPool)), DISPUTE_WINDOW, DISPUTE_WINDOW
+        );
+    }
+
+    function test_Constructor_Reverts_WhenMaxStalenessIsBelowDisputeWindow() public {
+        vm.expectRevert(IInvoiceStatusOracle.InvalidMaxStaleness.selector);
+
+        new InvoiceStatusOracle(
+            admin, invoiceNft, IInvoiceFinancingPool(address(mockPool)), DISPUTE_WINDOW, DISPUTE_WINDOW - 1
+        );
+    }
+
+    function test_Constructor_StoresDependenciesAndTimingConfiguration() public view {
+        assertEq(address(oracle.INVOICE_NFT()), address(invoiceNft));
+        assertEq(address(oracle.POOL()), address(mockPool));
+        assertEq(oracle.disputeWindow(), DISPUTE_WINDOW);
+        assertEq(oracle.maxStaleness(), MAX_STALENESS);
+    }
+
+    function test_Constructor_GrantsAdminOperationalRoles() public view {
+        assertTrue(oracle.hasRole(oracle.DEFAULT_ADMIN_ROLE(), admin));
+        assertTrue(oracle.hasRole(oracle.ORACLE_SUBMITTER_ROLE(), admin));
+        assertTrue(oracle.hasRole(oracle.DISPUTE_ADMIN_ROLE(), admin));
+    }
+
+    function test_SubmitStatus_Reverts_WhenCallerLacksSubmitterRole() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                unauthorizedCaller,
+                oracle.ORACLE_SUBMITTER_ROLE()
+            )
+        );
+        vm.prank(unauthorizedCaller);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+    }
+
+    function test_SubmitStatus_Reverts_WhenStatusIsCreated() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IInvoiceStatusOracle.InvalidOracleStatus.selector, IInvoiceNFT.InvoiceStatus.CREATED)
+        );
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.CREATED);
+    }
+
+    function test_SubmitStatus_Reverts_WhenStatusIsVerified() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IInvoiceStatusOracle.InvalidOracleStatus.selector, IInvoiceNFT.InvoiceStatus.VERIFIED
+            )
+        );
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.VERIFIED);
+    }
+
+    function test_SubmitStatus_Reverts_WhenStatusIsFunded() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IInvoiceStatusOracle.InvalidOracleStatus.selector, IInvoiceNFT.InvoiceStatus.FUNDED)
+        );
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.FUNDED);
+    }
+
+    function test_SubmitStatus_Reverts_WhenStatusIsFrozen() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IInvoiceStatusOracle.InvalidOracleStatus.selector, IInvoiceNFT.InvoiceStatus.FROZEN)
+        );
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.FROZEN);
+    }
+
+    function test_SubmitStatus_Reverts_WhenInvoiceIsNotFunded() public {
+        uint256 invoiceId = _createVerifiedInvoice();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IInvoiceStatusOracle.InvoiceNotFunded.selector, invoiceId, IInvoiceNFT.InvoiceStatus.VERIFIED
+            )
+        );
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+    }
+
+    function test_SubmitStatus_StoresSettledUpdate() public {
+        uint256 invoiceId = _createFundedInvoice();
+        uint256 submittedAt = block.timestamp;
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        assertEq(update.invoiceId, invoiceId);
+        assertEq(uint256(update.newStatus), uint256(IInvoiceNFT.InvoiceStatus.SETTLED));
+        assertEq(update.submittedAt, submittedAt);
+        assertFalse(update.disputed);
+        assertFalse(update.finalized);
+    }
+
+    function test_SubmitStatus_StoresDefaultedUpdate() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        assertEq(update.invoiceId, invoiceId);
+        assertEq(uint256(update.newStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+        assertEq(update.submittedAt, block.timestamp);
+        assertFalse(update.disputed);
+        assertFalse(update.finalized);
+    }
+
+    function test_SubmitStatus_Reverts_WhenActiveUpdateAlreadyExists() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateAlreadyActive.selector, invoiceId));
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+    }
+
+    function test_SubmitStatus_AllowsResubmissionAfterDispute() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        assertEq(uint256(update.newStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+        assertFalse(update.disputed);
+        assertFalse(update.finalized);
+    }
+
+    function test_SubmitStatus_AllowsResubmissionAfterUpdateBecomesStale() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory firstUpdate = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(firstUpdate.submittedAt + MAX_STALENESS + 1);
+
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+
+        IInvoiceStatusOracle.StatusUpdate memory secondUpdate = oracle.getStatusUpdate(invoiceId);
+
+        assertEq(uint256(secondUpdate.newStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+        assertEq(secondUpdate.submittedAt, block.timestamp);
+        assertFalse(secondUpdate.disputed);
+        assertFalse(secondUpdate.finalized);
+    }
+
+    function test_DisputeStatus_Reverts_WhenCallerLacksDisputeAdminRole() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                unauthorizedCaller,
+                oracle.DISPUTE_ADMIN_ROLE()
+            )
+        );
+        vm.prank(unauthorizedCaller);
+        oracle.disputeStatus(invoiceId);
+    }
+
+    function test_DisputeStatus_Reverts_WhenUpdateDoesNotExist() public {
+        uint256 nonexistentInvoiceId = 999;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateDoesNotExist.selector, nonexistentInvoiceId)
+        );
+        vm.prank(admin);
+        oracle.disputeStatus(nonexistentInvoiceId);
+    }
+
+    function test_DisputeStatus_MarksUpdateAsDisputed() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        assertTrue(update.disputed);
+        assertFalse(update.finalized);
+    }
+
+    function test_DisputeStatus_AllowsDisputeAtExactWindowBoundary() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+
+        update = oracle.getStatusUpdate(invoiceId);
+
+        assertTrue(update.disputed);
+    }
+
+    function test_DisputeStatus_Reverts_AfterDisputeWindowElapsed() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW + 1);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.DisputeWindowElapsed.selector, invoiceId));
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+    }
+
+    function test_DisputeStatus_Reverts_WhenUpdateAlreadyDisputed() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateDisputed.selector, invoiceId));
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+    }
+
+    function test_Finalize_Reverts_WhenUpdateDoesNotExist() public {
+        uint256 nonexistentInvoiceId = 999;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateDoesNotExist.selector, nonexistentInvoiceId)
+        );
+        oracle.finalize(nonexistentInvoiceId);
+    }
+
+    function test_Finalize_Reverts_WhenUpdateIsDisputed() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW + 1);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateDisputed.selector, invoiceId));
+        oracle.finalize(invoiceId);
+    }
+
+    function test_Finalize_Reverts_BeforeDisputeWindowElapsed() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        uint256 earliestFinalizeAt = update.submittedAt + DISPUTE_WINDOW;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IInvoiceStatusOracle.DisputeWindowNotElapsed.selector, invoiceId, earliestFinalizeAt)
+        );
+        oracle.finalize(invoiceId);
+    }
+
+    function test_Finalize_SucceedsAtExactDisputeWindowBoundary() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        vm.prank(finalizer);
+        oracle.finalize(invoiceId);
+
+        update = oracle.getStatusUpdate(invoiceId);
+
+        assertTrue(update.finalized);
+    }
+
+    function test_Finalize_SucceedsAtExactMaxStalenessBoundary() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + MAX_STALENESS);
+
+        vm.prank(finalizer);
+        oracle.finalize(invoiceId);
+
+        update = oracle.getStatusUpdate(invoiceId);
+
+        assertTrue(update.finalized);
+    }
+
+    function test_Finalize_Reverts_WhenUpdateIsStale() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        uint256 staleAfter = update.submittedAt + MAX_STALENESS;
+
+        vm.warp(staleAfter + 1);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateStale.selector, invoiceId, staleAfter));
+        oracle.finalize(invoiceId);
+    }
+
+    function test_Finalize_IsPermissionlessAndForwardsSettledStatusToPool() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        vm.prank(finalizer);
+        oracle.finalize(invoiceId);
+
+        assertEq(mockPool.lastInvoiceId(), invoiceId);
+        assertEq(uint256(mockPool.lastStatus()), uint256(IInvoiceNFT.InvoiceStatus.SETTLED));
+        assertEq(mockPool.callbackCount(), 1);
+    }
+
+    function test_Finalize_ForwardsDefaultedStatusToPool() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        oracle.finalize(invoiceId);
+
+        assertEq(mockPool.lastInvoiceId(), invoiceId);
+        assertEq(uint256(mockPool.lastStatus()), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+        assertEq(mockPool.callbackCount(), 1);
+    }
+
+    function test_Finalize_MarksUpdateFinalized() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        oracle.finalize(invoiceId);
+
+        update = oracle.getStatusUpdate(invoiceId);
+
+        assertTrue(update.finalized);
+        assertFalse(update.disputed);
+    }
+
+    function test_Finalize_Reverts_WhenUpdateAlreadyFinalized() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        oracle.finalize(invoiceId);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateAlreadyFinalized.selector, invoiceId));
+        oracle.finalize(invoiceId);
+
+        assertEq(mockPool.callbackCount(), 1);
+    }
+
+    function test_SubmitStatus_Reverts_WhenPreviousUpdateAlreadyFinalized() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        oracle.finalize(invoiceId);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateAlreadyFinalized.selector, invoiceId));
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED);
+    }
+
+    function test_DisputeStatus_Reverts_WhenUpdateAlreadyFinalized() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.SETTLED);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        vm.warp(update.submittedAt + DISPUTE_WINDOW);
+
+        oracle.finalize(invoiceId);
+
+        vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateAlreadyFinalized.selector, invoiceId));
+        vm.prank(admin);
+        oracle.disputeStatus(invoiceId);
+    }
+}

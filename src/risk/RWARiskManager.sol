@@ -98,7 +98,6 @@ contract RWARiskManager is AccessControl, IRWARiskManager {
     /// - due date is in the future
     /// - remaining tenor is within maxInvoiceTenor
     /// - calculated advance is non-zero
-    /// - buyer concentration limit is not exceeded
     ///
     /// @param invoiceId Invoice identifier in the InvoiceNFT registry.
     /// @return eligible True if the invoice passes all v1 eligibility checks.
@@ -129,10 +128,6 @@ contract RWARiskManager is AccessControl, IRWARiskManager {
             uint256 advance = calculateAdvance(invoice.faceValue);
 
             if (advance == 0) {
-                return false;
-            }
-
-            if (!checkConcentration(invoice.buyer, advance)) {
                 return false;
             }
 
