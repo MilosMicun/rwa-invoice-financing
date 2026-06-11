@@ -7,6 +7,7 @@ interface IInvoiceStatusOracle {
     struct StatusUpdate {
         uint256 invoiceId;
         IInvoiceNFT.InvoiceStatus newStatus;
+        uint256 recoveredAmount;
         uint256 submittedAt;
         bool disputed;
         bool finalized;
@@ -16,6 +17,7 @@ interface IInvoiceStatusOracle {
     error InvalidDisputeWindow();
     error InvalidMaxStaleness();
     error InvalidOracleStatus(IInvoiceNFT.InvoiceStatus status);
+    error InvalidRecoveryForStatus(IInvoiceNFT.InvoiceStatus status, uint256 recoveredAmount);
     error InvoiceNotFunded(uint256 invoiceId, IInvoiceNFT.InvoiceStatus currentStatus);
     error StatusUpdateAlreadyActive(uint256 invoiceId);
     error StatusUpdateDoesNotExist(uint256 invoiceId);
@@ -29,6 +31,7 @@ interface IInvoiceStatusOracle {
         uint256 indexed invoiceId,
         IInvoiceNFT.InvoiceStatus indexed newStatus,
         address indexed submitter,
+        uint256 recoveredAmount,
         uint256 submittedAt
     );
 
@@ -37,10 +40,14 @@ interface IInvoiceStatusOracle {
     );
 
     event StatusFinalized(
-        uint256 indexed invoiceId, IInvoiceNFT.InvoiceStatus indexed finalizedStatus, address indexed finalizer
+        uint256 indexed invoiceId,
+        IInvoiceNFT.InvoiceStatus indexed finalizedStatus,
+        address indexed finalizer,
+        uint256 recoveredAmount,
+        uint256 finalizedAt
     );
 
-    function submitStatus(uint256 invoiceId, IInvoiceNFT.InvoiceStatus newStatus) external;
+    function submitStatus(uint256 invoiceId, IInvoiceNFT.InvoiceStatus newStatus, uint256 recoveredAmount) external;
 
     function disputeStatus(uint256 invoiceId) external;
 

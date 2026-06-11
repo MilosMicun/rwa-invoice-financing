@@ -38,6 +38,7 @@ interface IInvoiceFinancingPool {
     error InvalidFeeShares();
     error UnauthorizedOracle(address caller);
     error InvalidOracleStatus(IInvoiceNFT.InvoiceStatus status);
+    error InvalidRecoveryForStatus(IInvoiceNFT.InvoiceStatus status, uint256 recoveredAmount);
     error OracleStatusAlreadyFinalized(uint256 invoiceId);
     error OracleStatusNotFinalized(uint256 invoiceId);
     error UnexpectedOracleStatus(
@@ -48,11 +49,14 @@ interface IInvoiceFinancingPool {
     error FinancingPositionAlreadyResolved(uint256 invoiceId);
     error InvoiceFrozen(uint256 invoiceId);
     error InvoiceNotFunded(uint256 invoiceId, IInvoiceNFT.InvoiceStatus currentStatus);
-    error RecoveredAmountExceedsPrincipal(uint256 recoveredAmount, uint256 principal);
+    error RecoveredAmountExceedsPrincipal(uint256 invoiceId, uint256 recoveredAmount, uint256 principal);
 
     event SeniorDeposited(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
+
     event JuniorDeposited(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
+
     event SeniorWithdrawn(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
+
     event JuniorWithdrawn(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
 
     /// @notice Emitted after a funded invoice is successfully settled through the paid-path waterfall.
@@ -104,13 +108,27 @@ interface IInvoiceFinancingPool {
 
     event InvoiceStatusOracleSet(address indexed oracle);
 
-    event OracleStatusFinalized(uint256 indexed invoiceId, IInvoiceNFT.InvoiceStatus indexed status);
+    /// @notice Emitted when the authorized oracle finalizes an outcome for a financed invoice.
+    /// @dev
+    /// `recoveredAmount` must be zero for SETTLED outcomes.
+    /// For DEFAULTED outcomes, it represents oracle-attested recovered principal.
+    event OracleStatusFinalized(
+        uint256 indexed invoiceId, IInvoiceNFT.InvoiceStatus indexed status, uint256 recoveredAmount
+    );
 
     function financeInvoice(uint256 invoiceId) external;
 
     function setInvoiceStatusOracle(address oracle) external;
 
-    function onStatusFinalized(uint256 invoiceId, IInvoiceNFT.InvoiceStatus status) external;
+    /// @notice Records an oracle-finalized outcome for an existing financed position.
+    /// @dev
+    /// Callable only by the configured oracle.
+    /// The implementation must reject outcomes for invoices without an existing
+    /// financing position and must validate recovery against the stored principal.
+    /// @param invoiceId Identifier of the financed invoice.
+    /// @param status Finalized terminal outcome: SETTLED or DEFAULTED.
+    /// @param recoveredAmount Oracle-attested recovered principal for a default.
+    function onStatusFinalized(uint256 invoiceId, IInvoiceNFT.InvoiceStatus status, uint256 recoveredAmount) external;
 
     /// @notice Executes paid-path settlement for a financed invoice.
     /// @dev Requires a finalized oracle SETTLED status.
@@ -119,14 +137,18 @@ interface IInvoiceFinancingPool {
     function settleInvoice(uint256 invoiceId, uint256 paidAmount) external;
 
     /// @notice Executes default-path recovery and loss recognition for a financed invoice.
-    /// @dev Requires a finalized oracle DEFAULTED status.
+    /// @dev
+    /// Requires a finalized oracle DEFAULTED status.
+    /// The recovery amount is read from the oracle-finalized outcome stored by the pool.
+    /// The caller cannot select or modify the recovery amount during execution.
     /// @param invoiceId Identifier of the financed invoice.
-    /// @param recoveredAmount Amount recovered against financed principal.
-    function resolveDefault(uint256 invoiceId, uint256 recoveredAmount) external;
+    function resolveDefault(uint256 invoiceId) external;
 
     function isOracleStatusFinalized(uint256 invoiceId) external view returns (bool finalized);
 
     function finalizedOracleStatus(uint256 invoiceId) external view returns (IInvoiceNFT.InvoiceStatus status);
+
+    function finalizedRecoveryAmount(uint256 invoiceId) external view returns (uint256 recoveredAmount);
 
     function invoiceStatusOracle() external view returns (address oracle);
 
@@ -177,3 +199,4 @@ interface IInvoiceFinancingPool {
             bool resolved
         );
 }
+

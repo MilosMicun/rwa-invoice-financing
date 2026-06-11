@@ -13,9 +13,10 @@ import {IInvoiceStatusOracle} from "../interfaces/IInvoiceStatusOracle.sol";
 /// This contract reports off-chain truth into the protocol through a simple
 /// submitter + dispute window pattern.
 ///
-/// It does not execute settlement accounting.
+/// It does not execute settlement/default accounting.
 /// It does not mutate InvoiceNFT directly.
-/// It only finalizes a status signal and calls InvoiceFinancingPool.onStatusFinalized().
+/// It finalizes a terminal status together with any recovered principal
+/// and forwards that outcome to InvoiceFinancingPool.onStatusFinalized().
 ///
 /// In v1, the deployer admin receives submitter and dispute roles for operational simplicity.
 /// Production deployments should separate these roles, preferably through a multisig or
@@ -81,20 +82,36 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
     }
 
     /// @notice Submits an off-chain terminal outcome for a funded invoice.
-    /// @dev Callable only by ORACLE_SUBMITTER_ROLE.
-    /// The submitted status is not immediately actionable. It must pass the dispute window
-    /// and be finalized before the pool can consume it during settlement/default resolution.
+    /// @dev
+    /// Callable only by ORACLE_SUBMITTER_ROLE.
+    ///
+    /// The submitted outcome is not immediately actionable. It must pass the dispute
+    /// window and be finalized before the pool can consume it during settlement/default
+    /// resolution.
+    ///
+    /// SETTLED outcomes must use a zero recovered amount because paid-path cash flow
+    /// is supplied and validated separately during settleInvoice().
+    ///
+    /// DEFAULTED outcomes may report zero or non-zero recovered principal. The pool
+    /// validates the reported amount against the stored financed principal during
+    /// finalization.
     ///
     /// Resubmission is allowed only when the previous update was disputed or stale.
     /// Active non-disputed updates cannot be overwritten, and finalized updates are immutable.
+    ///
     /// @param invoiceId Invoice identifier.
     /// @param newStatus Proposed terminal outcome: SETTLED or DEFAULTED.
-    function submitStatus(uint256 invoiceId, IInvoiceNFT.InvoiceStatus newStatus)
+    /// @param recoveredAmount Recovered principal reported for a DEFAULTED outcome.
+    function submitStatus(uint256 invoiceId, IInvoiceNFT.InvoiceStatus newStatus, uint256 recoveredAmount)
         external
         onlyRole(ORACLE_SUBMITTER_ROLE)
     {
         if (!_isAllowedOracleStatus(newStatus)) {
             revert InvalidOracleStatus(newStatus);
+        }
+
+        if (newStatus == IInvoiceNFT.InvoiceStatus.SETTLED && recoveredAmount != 0) {
+            revert InvalidRecoveryForStatus(newStatus, recoveredAmount);
         }
 
         IInvoiceNFT.Invoice memory invoice = INVOICE_NFT.getInvoice(invoiceId);
@@ -117,15 +134,22 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
         }
 
         statusUpdates[invoiceId] = StatusUpdate({
-            invoiceId: invoiceId, newStatus: newStatus, submittedAt: block.timestamp, disputed: false, finalized: false
+            invoiceId: invoiceId,
+            newStatus: newStatus,
+            recoveredAmount: recoveredAmount,
+            submittedAt: block.timestamp,
+            disputed: false,
+            finalized: false
         });
 
-        emit StatusSubmitted(invoiceId, newStatus, msg.sender, block.timestamp);
+        emit StatusSubmitted(invoiceId, newStatus, msg.sender, recoveredAmount, block.timestamp);
     }
 
     /// @notice Disputes a submitted status update during the dispute window.
-    /// @dev Callable only by DISPUTE_ADMIN_ROLE.
-    /// A disputed update cannot be finalized, but a new status can be submitted later.
+    /// @dev
+    /// Callable only by DISPUTE_ADMIN_ROLE.
+    /// A disputed update cannot be finalized, but a new outcome can be submitted later.
+    /// The replacement update may use a different status and recovered amount.
     /// @param invoiceId Invoice identifier.
     function disputeStatus(uint256 invoiceId) external onlyRole(DISPUTE_ADMIN_ROLE) {
         StatusUpdate storage update = statusUpdates[invoiceId];
@@ -152,14 +176,23 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
     }
 
     /// @notice Finalizes a submitted status update after the dispute window has elapsed.
-    /// @dev Callable by anyone once timing and dispute checks pass.
-    /// Finalization only propagates the status signal to the pool.
-    /// It does not execute settlement/default accounting and does not mutate InvoiceNFT directly.
+    /// @dev
+    /// Callable by anyone once timing and dispute checks pass.
+    ///
+    /// Finalization propagates the complete oracle-attested outcome to the pool:
+    /// terminal status plus recovered principal.
+    ///
+    /// It does not execute settlement/default accounting and does not mutate InvoiceNFT
+    /// directly. InvoiceFinancingPool validates that a financing position exists and
+    /// that default recovery does not exceed its stored principal.
     ///
     /// If an invoice becomes FROZEN after submission, this function may still finalize
-    /// the oracle signal because it does not execute accounting or mutate InvoiceNFT.
-    /// DAY 96 settlement/default functions must separately reject FROZEN invoices before
-    /// applying waterfall accounting.
+    /// the oracle outcome because it does not execute waterfall accounting or mutate
+    /// InvoiceNFT. Settlement/default execution must separately reject FROZEN invoices.
+    ///
+    /// If the pool callback reverts, the entire finalization transaction reverts,
+    /// including the local `finalized` state update.
+    ///
     /// @param invoiceId Invoice identifier.
     function finalize(uint256 invoiceId) external {
         StatusUpdate storage update = statusUpdates[invoiceId];
@@ -194,9 +227,9 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
 
         update.finalized = true;
 
-        POOL.onStatusFinalized(invoiceId, update.newStatus);
+        POOL.onStatusFinalized(invoiceId, update.newStatus, update.recoveredAmount);
 
-        emit StatusFinalized(invoiceId, update.newStatus, msg.sender);
+        emit StatusFinalized(invoiceId, update.newStatus, msg.sender, update.recoveredAmount, block.timestamp);
     }
 
     /// @dev Returns true only for terminal off-chain outcome statuses accepted by this oracle.
@@ -204,3 +237,4 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
         return status == IInvoiceNFT.InvoiceStatus.SETTLED || status == IInvoiceNFT.InvoiceStatus.DEFAULTED;
     }
 }
+

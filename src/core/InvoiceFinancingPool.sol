@@ -77,6 +77,13 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// valid finalized oracle outcomes in v1.
     mapping(uint256 invoiceId => IInvoiceNFT.InvoiceStatus status) public finalizedOracleStatus;
 
+    /// @notice Oracle-attested recovered principal recorded for each finalized invoice outcome.
+    /// @dev
+    /// Must be zero for SETTLED outcomes.
+    /// For DEFAULTED outcomes, this value is the only recovery amount consumed
+    /// by default resolution accounting.
+    mapping(uint256 invoiceId => uint256 recoveredAmount) public finalizedRecoveryAmount;
+
     /// @notice Per-invoice financing positions created when invoices are funded.
     /// @dev A position remains stored after settlement/default for auditability.
     mapping(uint256 invoiceId => FinancingPosition position) public financingPositions;
@@ -157,15 +164,24 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         emit InvoiceStatusOracleSet(oracle);
     }
 
-    /// @notice Receives finalized invoice outcome from the configured oracle.
+    /// @notice Receives a finalized invoice outcome from the configured oracle.
     /// @dev
     /// Callable only by the configured InvoiceStatusOracle.
-    /// This function only records the finalized oracle status.
-    /// It does not execute settlement/default accounting and does not mutate InvoiceNFT.
-    /// The pool repeats status validation intentionally as defense-in-depth.
-    /// @param invoiceId Invoice identifier.
-    /// @param status Finalized oracle outcome.
-    function onStatusFinalized(uint256 invoiceId, IInvoiceNFT.InvoiceStatus status) external {
+    ///
+    /// This function records both the terminal status and the oracle-attested
+    /// recovered principal. It does not execute settlement/default accounting
+    /// and does not mutate InvoiceNFT.
+    ///
+    /// A financing position must already exist. Oracle outcomes cannot be
+    /// preloaded before an invoice becomes an active financed position.
+    ///
+    /// SETTLED outcomes must use zero recovery.
+    /// DEFAULTED recovery must not exceed the stored financed principal.
+    ///
+    /// @param invoiceId Identifier of the financed invoice.
+    /// @param status Finalized oracle outcome: SETTLED or DEFAULTED.
+    /// @param recoveredAmount Oracle-attested recovered principal.
+    function onStatusFinalized(uint256 invoiceId, IInvoiceNFT.InvoiceStatus status, uint256 recoveredAmount) external {
         if (invoiceStatusOracle == address(0)) {
             revert OracleNotSet();
         }
@@ -178,6 +194,12 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             revert InvalidOracleStatus(status);
         }
 
+        FinancingPosition storage position = financingPositions[invoiceId];
+
+        if (position.fundedAt == 0) {
+            revert FinancingPositionDoesNotExist(invoiceId);
+        }
+
         IInvoiceNFT.InvoiceStatus currentStatus = finalizedOracleStatus[invoiceId];
 
         if (currentStatus == IInvoiceNFT.InvoiceStatus.SETTLED || currentStatus == IInvoiceNFT.InvoiceStatus.DEFAULTED)
@@ -185,9 +207,18 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             revert OracleStatusAlreadyFinalized(invoiceId);
         }
 
-        finalizedOracleStatus[invoiceId] = status;
+        if (status == IInvoiceNFT.InvoiceStatus.SETTLED) {
+            if (recoveredAmount != 0) {
+                revert InvalidRecoveryForStatus(status, recoveredAmount);
+            }
+        } else if (recoveredAmount > position.principal) {
+            revert RecoveredAmountExceedsPrincipal(invoiceId, recoveredAmount, position.principal);
+        }
 
-        emit OracleStatusFinalized(invoiceId, status);
+        finalizedOracleStatus[invoiceId] = status;
+        finalizedRecoveryAmount[invoiceId] = recoveredAmount;
+
+        emit OracleStatusFinalized(invoiceId, status, recoveredAmount);
     }
 
     /// @notice Returns whether an invoice has a finalized oracle outcome.
@@ -423,13 +454,16 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// Consumes a finalized oracle DEFAULTED status and executes the default-path recovery
     /// and loss waterfall for an active financing position.
     ///
-    /// The oracle only finalizes the off-chain default outcome. This pool performs
-    /// recovery allocation, NAV writedowns, bad debt accounting, and marks the InvoiceNFT
-    /// as DEFAULTED only after successful default execution.
+    /// The oracle finalizes both the off-chain default status and the recovered principal.
+    /// This pool performs recovery allocation, NAV writedowns, bad debt accounting,
+    /// and marks the InvoiceNFT as DEFAULTED only after successful default execution.
     ///
     /// The function is permissionless in v1: any caller may execute default resolution
-    /// after oracle finalization, provided they hold approval for any declared `recoveredAmount`.
-    /// This keeps default execution authority separate from oracle reporting authority.
+    /// after oracle finalization, provided they hold enough assets and approval to supply
+    /// the oracle-finalized recovered principal.
+    ///
+    /// The caller cannot select or modify the recovered amount.
+    /// Default accounting consumes only the value previously finalized by the oracle.
     ///
     /// Requirements:
     /// - The invoice must have an active financing position.
@@ -437,7 +471,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// - The oracle must have finalized DEFAULTED for the invoice.
     /// - The InvoiceNFT lifecycle status must still be FUNDED.
     /// - The invoice must not be FROZEN.
-    /// - `recoveredAmount` must not exceed financed principal.
+    /// - The oracle-finalized recovered amount must not exceed financed principal.
     ///
     /// Accounting:
     /// - Recovered principal is allocated to SeniorPool first, then JuniorPool.
@@ -449,8 +483,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// - The financing position is marked resolved before external calls for CEI safety.
     ///
     /// @param invoiceId Identifier of the financed invoice.
-    /// @param recoveredAmount Amount recovered against financed principal during default resolution.
-    function resolveDefault(uint256 invoiceId, uint256 recoveredAmount) external {
+    function resolveDefault(uint256 invoiceId) external {
         FinancingPosition storage position = financingPositions[invoiceId];
 
         if (position.fundedAt == 0) {
@@ -471,6 +504,8 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             revert UnexpectedOracleStatus(invoiceId, oracleStatus, IInvoiceNFT.InvoiceStatus.DEFAULTED);
         }
 
+        uint256 recoveredAmount = finalizedRecoveryAmount[invoiceId];
+
         IInvoiceNFT.Invoice memory invoice = INVOICE_NFT.getInvoice(invoiceId);
 
         if (invoice.status == IInvoiceNFT.InvoiceStatus.FROZEN) {
@@ -482,7 +517,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         }
 
         if (recoveredAmount > position.principal) {
-            revert RecoveredAmountExceedsPrincipal(recoveredAmount, position.principal);
+            revert RecoveredAmountExceedsPrincipal(invoiceId, recoveredAmount, position.principal);
         }
 
         uint256 seniorRecovery = recoveredAmount > position.seniorPrincipal ? position.seniorPrincipal : recoveredAmount;
@@ -689,3 +724,4 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         return status == IInvoiceNFT.InvoiceStatus.SETTLED || status == IInvoiceNFT.InvoiceStatus.DEFAULTED;
     }
 }
+
