@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IInvoiceNFT} from "../interfaces/IInvoiceNFT.sol";
 import {IRWARiskManager} from "../interfaces/IRWARiskManager.sol";
@@ -42,10 +43,15 @@ contract RWARiskManager is AccessControl, IRWARiskManager {
     /// @dev 5,000 bps = 50% APR. This is a bounded governance guardrail.
     uint256 public constant MAX_FINANCING_FEE_APR_BPS = 5_000;
 
+    /// @notice Maximum invoice tenor allowed by governance in v1.
+    /// @dev Keeps fee growth and underwriting duration inside a bounded RWA domain.
+    uint256 public constant MAX_INVOICE_TENOR_SECONDS = 365 days;
+
     error ZeroAddress();
     error InvalidRiskParams();
     error AdvanceRateTooHigh();
     error FinancingFeeAprTooHigh();
+    error MaxInvoiceTenorTooHigh();
     error ExposureUnderflow();
 
     /// @notice Canonical invoice lifecycle registry used for eligibility checks.
@@ -149,22 +155,28 @@ contract RWARiskManager is AccessControl, IRWARiskManager {
 
     /// @notice Checks whether adding new financed principal would stay within buyer concentration limits.
     /// @dev
-    /// This function is public so it can be reused internally by isEligible().
+    /// Uses subtraction-based comparison to avoid overflow from buyerExposure + newAmount.
     /// @param buyer Buyer address whose concentration limit is checked.
     /// @param newAmount New financed principal amount to test.
     /// @return allowed True if buyerExposure[buyer] + newAmount does not exceed maxExposurePerBuyer.
     function checkConcentration(address buyer, uint256 newAmount) public view returns (bool allowed) {
-        return buyerExposure[buyer] + newAmount <= riskParams.maxExposurePerBuyer;
+        uint256 maxExposure = riskParams.maxExposurePerBuyer;
+
+        if (newAmount > maxExposure) {
+            return false;
+        }
+
+        return buyerExposure[buyer] <= maxExposure - newAmount;
     }
 
     /// @notice Calculates the financed principal advanced against invoice face value.
     /// @dev
-    /// The advance is calculated from the configured advanceRate in basis points.
+    /// Uses full-precision mulDiv so extreme face values cannot overflow before division.
     /// The resulting amount is the principal that InvoiceFinancingPool will lock and send to the supplier.
     /// @param faceValue Nominal invoice amount.
     /// @return advance Financed principal amount.
     function calculateAdvance(uint256 faceValue) public view returns (uint256 advance) {
-        return faceValue * riskParams.advanceRate / BPS_DENOMINATOR;
+        return Math.mulDiv(faceValue, riskParams.advanceRate, BPS_DENOMINATOR);
     }
 
     /// @notice Calculates the financing fee for a funded invoice.
@@ -185,8 +197,9 @@ contract RWARiskManager is AccessControl, IRWARiskManager {
         }
 
         uint256 duration = dueDate - fundedAt;
+        uint256 aprDuration = riskParams.financingFeeApr * duration;
 
-        return principal * riskParams.financingFeeApr * duration / (365 days * BPS_DENOMINATOR);
+        return Math.mulDiv(principal, aprDuration, 365 days * BPS_DENOMINATOR);
     }
 
     /// @notice Updates global risk parameters.
@@ -268,6 +281,10 @@ contract RWARiskManager is AccessControl, IRWARiskManager {
 
         if (newRiskParams.financingFeeApr > MAX_FINANCING_FEE_APR_BPS) {
             revert FinancingFeeAprTooHigh();
+        }
+
+        if (newRiskParams.maxInvoiceTenor > MAX_INVOICE_TENOR_SECONDS) {
+            revert MaxInvoiceTenorTooHigh();
         }
 
         riskParams = newRiskParams;

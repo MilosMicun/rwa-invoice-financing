@@ -216,6 +216,30 @@ contract RWARiskManagerTest is Test {
         assertEq(financingFeeApr, 0);
     }
 
+    function test_SetRiskParams_AcceptsMaximumInvoiceTenor() public {
+        IRWARiskManager.RiskParams memory params = _defaultRiskParams();
+
+        params.maxInvoiceTenor = riskManager.MAX_INVOICE_TENOR_SECONDS();
+
+        vm.prank(admin);
+        riskManager.setRiskParams(params);
+
+        (,, uint256 maxInvoiceTenor,,) = riskManager.riskParams();
+
+        assertEq(maxInvoiceTenor, riskManager.MAX_INVOICE_TENOR_SECONDS());
+    }
+
+    function test_SetRiskParams_Reverts_WhenMaxInvoiceTenorExceedsMaximum() public {
+        IRWARiskManager.RiskParams memory params = _defaultRiskParams();
+
+        params.maxInvoiceTenor = riskManager.MAX_INVOICE_TENOR_SECONDS() + 1;
+
+        vm.expectRevert(RWARiskManager.MaxInvoiceTenorTooHigh.selector);
+
+        vm.prank(admin);
+        riskManager.setRiskParams(params);
+    }
+
     function test_CalculateAdvance_ReturnsExpectedPrincipal() public view {
         uint256 expectedAdvance = FACE_VALUE * ADVANCE_RATE_BPS / BPS;
 
