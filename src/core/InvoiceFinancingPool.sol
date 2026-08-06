@@ -34,6 +34,7 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
 
     error ZeroAssets();
     error InvalidFundingShares();
+    error ZeroTranchePrincipal(uint256 invoiceId, uint256 seniorPrincipal, uint256 juniorPrincipal);
     error InvoiceNotEligible(uint256 invoiceId);
     error InvoiceAlreadyFinanced(uint256 invoiceId);
     error UnauthorizedFinancer(uint256 invoiceId, address caller);
@@ -110,7 +111,10 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             revert ZeroAddress();
         }
 
-        if (seniorFundingShareBps_ + juniorFundingShareBps_ != BPS_DENOMINATOR) {
+        if (
+            seniorFundingShareBps_ == 0 || juniorFundingShareBps_ == 0
+                || seniorFundingShareBps_ + juniorFundingShareBps_ != BPS_DENOMINATOR
+        ) {
             revert InvalidFundingShares();
         }
 
@@ -276,6 +280,10 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         // This keeps senior funding bounded by its configured share and preserves principal conservation.
         uint256 seniorPrincipal = principal * SENIOR_FUNDING_SHARE_BPS / BPS_DENOMINATOR;
         uint256 juniorPrincipal = principal - seniorPrincipal;
+
+        if (seniorPrincipal == 0 || juniorPrincipal == 0) {
+            revert ZeroTranchePrincipal(invoiceId, seniorPrincipal, juniorPrincipal);
+        }
 
         if (SENIOR_POOL.availableLiquidity() < seniorPrincipal) {
             revert InsufficientSeniorLiquidity();

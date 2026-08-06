@@ -135,6 +135,77 @@ contract InvoiceFinancingPoolAdminTest is Test {
         assertEq(pool.invoiceStatusOracle(), address(0));
     }
 
+    function test_Constructor_Reverts_WhenSeniorFundingShareIsZero() public {
+        vm.expectRevert(InvoiceFinancingPool.InvalidFundingShares.selector);
+
+        vm.prank(admin);
+        new InvoiceFinancingPool(asset, invoiceNft, riskManager, 0, 10_000, SENIOR_FEE_SHARE_BPS, JUNIOR_FEE_SHARE_BPS);
+    }
+
+    function test_Constructor_Reverts_WhenJuniorFundingShareIsZero() public {
+        vm.expectRevert(InvoiceFinancingPool.InvalidFundingShares.selector);
+
+        vm.prank(admin);
+        new InvoiceFinancingPool(asset, invoiceNft, riskManager, 10_000, 0, SENIOR_FEE_SHARE_BPS, JUNIOR_FEE_SHARE_BPS);
+    }
+
+    function test_FinanceInvoice_Reverts_WhenTranchePrincipalIsZero() public {
+        IRWARiskManager.RiskParams memory params = IRWARiskManager.RiskParams({
+            maxExposurePerBuyer: MAX_EXPOSURE_PER_BUYER,
+            advanceRate: ADVANCE_RATE_BPS,
+            maxInvoiceTenor: MAX_INVOICE_TENOR,
+            minInvoiceAmount: 2,
+            financingFeeApr: FINANCING_FEE_APR_BPS
+        });
+
+        vm.prank(admin);
+        riskManager.setRiskParams(params);
+
+        vm.prank(originator);
+        uint256 invoiceId = invoiceNft.createInvoice(supplier, buyer, 2, block.timestamp + INVOICE_TENOR);
+
+        vm.prank(verifier);
+        invoiceNft.verify(invoiceId);
+
+        // principal = floor(2 * 8_000 / 10_000) = 1
+        // seniorPrincipal = floor(1 * 7_000 / 10_000) = 0
+        // juniorPrincipal = 1
+        vm.expectRevert(abi.encodeWithSelector(InvoiceFinancingPool.ZeroTranchePrincipal.selector, invoiceId, 0, 1));
+
+        vm.prank(supplier);
+        pool.financeInvoice(invoiceId);
+
+        assertEq(pool.totalLockedAssets(), 0);
+        assertEq(riskManager.getBuyerExposure(buyer), 0);
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.VERIFIED));
+    }
+
+    function test_FinanceInvoice_Succeeds_WhenFaceValueEqualsMinimumAmount() public {
+        _depositTranches();
+
+        vm.prank(originator);
+        uint256 invoiceId =
+            invoiceNft.createInvoice(supplier, buyer, MIN_INVOICE_AMOUNT, block.timestamp + INVOICE_TENOR);
+
+        vm.prank(verifier);
+        invoiceNft.verify(invoiceId);
+
+        vm.prank(supplier);
+        pool.financeInvoice(invoiceId);
+
+        uint256 expectedPrincipal = MIN_INVOICE_AMOUNT * ADVANCE_RATE_BPS / 10_000;
+
+        (,, uint256 principal, uint256 seniorPrincipal, uint256 juniorPrincipal,,,,) =
+            pool.financingPositions(invoiceId);
+
+        assertEq(principal, expectedPrincipal);
+        assertGt(seniorPrincipal, 0);
+        assertGt(juniorPrincipal, 0);
+        assertEq(seniorPrincipal + juniorPrincipal, principal);
+        assertEq(pool.totalLockedAssets(), principal);
+        assertEq(uint256(invoiceNft.getInvoice(invoiceId).status), uint256(IInvoiceNFT.InvoiceStatus.FUNDED));
+    }
+
     function test_SetInvoiceStatusOracle_SetsOracle() public {
         _setOracle();
 
