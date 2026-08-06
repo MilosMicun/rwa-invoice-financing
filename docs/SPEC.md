@@ -2,1355 +2,1527 @@
 
 ## Overview
 
-This document defines the core financial model, actors, state machine, accounting rules,
-and liquidity architecture of the RWA Invoice Financing Protocol.
+This document defines the v1 financial model, actor permissions, contract responsibilities, lifecycle state machine, oracle outcome flow, tranche accounting, settlement waterfalls, and liquidity constraints of the RWA Invoice Financing Protocol.
 
-The protocol models invoice financing as an on-chain representation of real-world
-receivables financing. Suppliers receive liquidity before invoice maturity, liquidity
-providers fund senior and junior capital pools, and invoice settlement outcomes are
-reported on-chain through permissioned oracle updates.
+The protocol models real-world invoice financing through:
 
-The goal of this specification is to define the system before implementation.
+* non-transferable invoice claim NFTs;
+* permissioned invoice verification and risk controls;
+* Senior and Junior ERC-4626 liquidity tranches;
+* supplier-requested financing;
+* permissioned oracle reporting of off-chain terminal outcomes;
+* deterministic settlement and default accounting;
+* explicit separation between lifecycle state, accounting state, and off-chain truth.
 
-The smart contracts should be treated as an implementation of this specification,
-not the other way around.
+Suppliers receive liquidity before invoice maturity. Senior and Junior liquidity providers finance those advances. Off-chain payment or default outcomes are submitted through an authorized oracle process and consumed by the pool through deterministic accounting rules.
 
-## v1 Scope and Non-Goals
+The protocol is not trustless. Invoice validity, buyer payment, legal enforceability, and recovered principal exist outside the blockchain. The architecture therefore focuses on making trust assumptions explicit and preventing trusted actors from bypassing on-chain accounting rules.
 
-The v1 protocol intentionally prioritizes deterministic accounting, explicit state
-transitions, and auditability over feature completeness.
-
-The following features are intentionally excluded from v1:
-
-- Partial settlement states
-- Secondary trading of invoice NFTs
-- Dynamic interest rates
-- Multi-oracle quorum settlement
-- Automated legal enforcement
-- Insurance reserves
-- Refinancing or restructuring of invoices
-- Epoch-based withdrawal queues
-- Automated liquidation markets
-
-These exclusions are intentional. The purpose of v1 is to model the core financial
-machine clearly before adding production-level complexity.
-
-## Core Invariants
-
-- An invoice can be financed at most once.
-- Only VERIFIED invoices can be funded.
-- Only FUNDED invoices can be settled.
-- Only FUNDED invoices can be defaulted.
-- SETTLED and DEFAULTED invoices are terminal.
-- Settlement and default execution are mutually exclusive.
-- `totalLockedAssets` must never exceed `totalPoolAssets`.
-- SeniorPool and JuniorPool must track locked assets independently.
-- Funding must fail if either tranche lacks sufficient available liquidity.
-- LP withdrawals must not reduce available liquidity below locked asset requirements.
-- Freeze and unfreeze operations must not change economic accounting.
-- Admin and OracleSubmitter roles must not bypass waterfall accounting.
-- Oracle updates must be constrained by the invoice state machine.
-- Waterfall execution must be deterministic for the same input values.
+The smart contracts are intended to implement this specification.
 
 ---
 
-# 1. Actors and Roles
+# 1. v1 Scope and Non-Goals
 
-## Supplier
+The v1 protocol prioritizes:
+
+* deterministic accounting;
+* explicit state transitions;
+* clear trust boundaries;
+* tranche-level NAV accounting;
+* auditability;
+* focused security testing.
+
+The following features are intentionally excluded from v1:
+
+* partial settlement lifecycle states;
+* recovery of financing fees during default;
+* secondary trading of invoice NFTs;
+* dynamic or per-invoice interest rates;
+* multi-oracle quorum;
+* recovery escrow;
+* automated bank-payment reconciliation;
+* automated legal enforcement;
+* cross-protocol invoice uniqueness;
+* insurance reserves;
+* refinancing or restructuring;
+* withdrawal queues;
+* epoch-based liquidity;
+* automated liquidation markets;
+* protocol upgradeability;
+* KYC or LP whitelisting;
+* protocol-wide pause functionality.
+
+These exclusions are deliberate. The v1 implementation models the core financial machine before adding production-level operational complexity.
+
+---
+
+# 2. Core Design Principles
+
+## 2.1 Lifecycle State and Accounting State Are Separate
+
+`InvoiceNFT.sol` is the canonical source of truth for invoice lifecycle state.
+
+`InvoiceFinancingPool.sol` is the canonical source of truth for financing and accounting state.
+
+`InvoiceStatusOracle.sol` is the canonical source of finalized off-chain terminal outcomes before accounting execution.
+
+These responsibilities must not be collapsed into one contract or one privileged role.
+
+---
+
+## 2.2 Oracle Truth and Accounting Execution Are Separate
+
+The oracle reports off-chain economic truth:
+
+* whether a funded invoice is `SETTLED` or `DEFAULTED`;
+* recovered principal for a `DEFAULTED` outcome.
+
+The oracle does not:
+
+* transfer repayment assets;
+* execute tranche accounting;
+* write down NAV;
+* update buyer exposure;
+* transition InvoiceNFT to a terminal state.
+
+The pool validates and stores the finalized oracle outcome.
+
+A permissionless executor later supplies the required assets and triggers deterministic settlement or default accounting.
+
+The executor cannot choose or modify the finalized economic outcome.
+
+---
+
+## 2.3 NAV Is Not Raw Token Balance
+
+SeniorPool and JuniorPool account for active receivable exposure as part of NAV even after the corresponding cash has been transferred to the Supplier.
+
+Therefore:
+
+```text
+ERC-4626 totalAssets != raw token balance
+```
+
+Each tranche separately tracks:
+
+* `accountedAssets`: tranche NAV;
+* `lockedAssets`: NAV committed to active financing positions;
+* raw ERC-20 token balance: immediately available cash backing.
+
+---
+
+## 2.4 Active Position Terms Are Immutable
+
+The following values are stored when an invoice is financed:
+
+* financed principal;
+* Senior principal;
+* Junior principal;
+* financing fee;
+* funding timestamp;
+* due date;
+* Supplier;
+* Buyer.
+
+Later changes to risk parameters, funding shares, or fee shares must not retroactively change an active financing position.
+
+---
+
+# 3. Core Invariants
+
+The protocol must preserve the following properties:
+
+* An invoice can be financed at most once.
+* Only `VERIFIED` invoices can be funded.
+* Only `FUNDED` invoices can be settled.
+* Only `FUNDED` invoices can be defaulted.
+* `SETTLED` and `DEFAULTED` are terminal lifecycle states.
+* Settlement and default execution are mutually exclusive.
+* A financing position can be resolved at most once.
+* Oracle outcomes can be finalized only for existing financed positions.
+* A finalized oracle outcome cannot be overwritten.
+* A `SETTLED` oracle outcome must have zero recovered principal.
+* A `DEFAULTED` recovered amount must not exceed financed principal.
+* A permissionless executor cannot choose or modify recovered principal.
+* Default execution must use exactly the oracle-finalized recovered principal.
+* Funding share components must conserve principal.
+* Fee share components must conserve the stored financing fee.
+* Default recovery allocation must conserve recovered principal.
+* Default loss allocation must conserve realized principal loss.
+* Settlement must not increase `totalBadDebt`.
+* Default bad-debt increase must equal financed principal minus finalized recovered principal.
+* Unpaid financing fee must not be counted as principal bad debt.
+* `totalBadDebt` must never decrease during normal operation.
+* `totalLockedAssets` must equal unresolved financed principal.
+* Senior and Junior locked assets must be tracked independently.
+* Senior locked assets plus Junior locked assets must equal aggregate locked assets.
+* Tranche locked assets must never exceed tranche NAV.
+* Funding must fail if either tranche lacks sufficient available liquidity.
+* LP withdrawals must not consume locked liquidity.
+* Freeze and unfreeze must not change principal, NAV, fee, exposure, or locked-asset accounting.
+* Resolution of one invoice must not mutate unrelated financing positions.
+
+---
+
+# 4. Actors and Roles
+
+## 4.1 Originator
+
+### Economic Role
+
+The Originator registers an off-chain invoice claim in the protocol.
+
+The Originator may be a servicing entity, financing platform, or other authorized operational actor responsible for onboarding receivable data.
+
+### Permissions
+
+* Create InvoiceNFT records.
+* Provide Supplier, Buyer, face value, and due date.
+
+### Cannot
+
+* Verify its own invoice unless separately granted the Verifier role.
+* Finance an invoice on behalf of the Supplier.
+* Report settlement or default outcomes.
+* Execute lifecycle terminal transitions directly.
+* Move tranche liquidity.
+
+---
+
+## 4.2 Supplier
 
 ### Economic Role
 
 The Supplier is the original creditor of the invoice receivable.
 
-The Supplier transfers receivable exposure to the financing protocol in exchange for
-immediate liquidity before the invoice maturity date.
-
-Invoices submitted to the protocol are expected to represent valid off-chain payment
-obligations accepted by the Buyer. In the Serbian market context, this may include
-invoices registered and accepted through the SEF system.
-
-Each financed invoice is represented by an NFT that models the receivable claim and
-its lifecycle state within the protocol. The invoice NFT is not treated as simple
-metadata storage, but as a financial position with explicit state transitions.
+The Supplier exchanges part of the future receivable value for immediate liquidity.
 
 ### Permissions
 
-- Create invoice financing requests
-- Submit invoices for protocol eligibility review
-- Request financing against approved invoices
-- Receive liquidity advances from the financing pool
+* Request financing for an invoice where it is the recorded Supplier.
+* Receive the financed principal.
+* Receive surplus paid above principal plus financing fee during settlement.
 
 ### Cannot
 
-- Update oracle settlement data
-- Confirm invoice repayment status
-- Trigger default resolution
-- Freeze or unfreeze invoices
-- Finance the same invoice more than once
+* Verify the invoice.
+* Determine oracle settlement truth.
+* Select default recovery.
+* Modify tranche accounting.
+* Finance the same invoice twice.
 
-The Supplier must never control settlement truth or default resolution, as this would
-allow manipulation of protocol accounting and bad debt recognition.
-
-### Main Risks
-
-- Invoice rejection during eligibility review
-- Buyer non-payment or delayed payment
-- Invoice disputes
-- Operational freezes
-- Legal unenforceability of receivables
-- Reduced financing advance rate
-- Delayed liquidity access during protocol stress
+The Supplier has no privileged settlement or default authority. Like any address, it may technically act as a permissionless executor if it supplies the required tokens, but it cannot alter the finalized outcome.
 
 ---
 
-## Buyer
+## 4.3 Buyer
 
 ### Economic Role
 
-The Buyer is the off-chain payment obligor associated with an invoice financed by
-the protocol.
+The Buyer is the off-chain payment obligor associated with the invoice.
 
-The Buyer does not act as an on-chain protocol participant, but represents the
-underlying credit exposure that determines invoice repayment, settlement completion,
-and default risk.
+Buyer credit quality and payment behavior determine the underlying economic risk.
 
-The economic solvency of the protocol is directly influenced by Buyer payment behavior
-and concentration exposure.
+### Privileges
 
-### Permissions
+The Buyer receives no privileged on-chain role.
 
-The Buyer has no direct on-chain permissions within the protocol.
+It may act as a permissionless settlement payer or executor, but it cannot:
 
-Invoice repayment is expected to occur off-chain through traditional payment rails and
-is later reflected on-chain through authorized oracle updates.
-
-### Cannot
-
-- Modify invoice lifecycle state
-- Trigger settlement execution
-- Update repayment status
-- Modify invoice maturity terms
-- Influence waterfall accounting logic
-
-Off-chain payment obligors must never control on-chain settlement truth, as this would
-compromise accounting integrity and bad debt recognition.
-
-### Main Risks
-
-- Payment default
-- Delayed settlement
-- Invoice disputes
-- Buyer insolvency
-- Jurisdictional enforcement failure
-- Concentration risk from excessive exposure to a single Buyer
+* change invoice lifecycle state directly;
+* submit oracle outcomes without an oracle role;
+* modify principal, fee, or recovery;
+* override waterfall accounting.
 
 ---
 
-## Senior Liquidity Provider
+## 4.4 Verifier
 
 ### Economic Role
 
-The Senior Liquidity Provider supplies conservative liquidity capital to the protocol
-in exchange for lower-risk yield exposure.
-
-Senior liquidity is deposited into the SeniorPool ERC-4626 vault and receives
-repayment priority during recovery and default resolution flows.
-
-Senior capital is economically protected by the Junior tranche, which absorbs
-first-loss exposure before losses impact Senior liquidity providers.
-
-Senior liquidity is protected, but not guaranteed.
+The Verifier confirms that a created invoice may progress into the financing lifecycle.
 
 ### Permissions
 
-- Deposit liquidity into the SeniorPool
-- Receive ERC-4626 vault shares
-- Redeem available liquidity that is not locked in active financing positions
-- Accrue financing yield through waterfall distributions
+* Transition an invoice from `CREATED` to `VERIFIED`.
 
 ### Cannot
 
-- Select invoices for financing
-- Control invoice valuation
-- Modify oracle settlement data
-- Withdraw liquidity locked in active invoice financing positions
-- Influence waterfall accounting execution
+* Finance the invoice.
+* Update buyer exposure.
+* report settlement or default;
+* freeze or unfreeze invoices unless separately granted the Risk role.
 
-Senior liquidity providers must not control underwriting or settlement truth, as this
-would compromise pool neutrality and accounting integrity.
-
-### Main Risks
-
-- Residual bad debt after Junior tranche depletion
-- Liquidity delays caused by locked financing positions
-- Systemic Buyer defaults
-- Concentration exposure to large Buyers
-- Oracle failure or delayed settlement reporting
-- Share price decline from protocol losses
+The Verifier role and Originator role are logically separate.
 
 ---
 
-## Junior Liquidity Provider
+## 4.5 Risk Administrator
 
 ### Economic Role
 
-The Junior Liquidity Provider supplies higher-risk liquidity capital to the protocol
-in exchange for enhanced yield exposure.
+The Risk Administrator manages underwriting configuration and operational invoice risk controls.
 
-Junior liquidity is deposited into the JuniorPool ERC-4626 vault and absorbs
-first-loss exposure during default and bad debt events.
+The Risk Manager administrator may:
 
-The Junior tranche economically protects Senior liquidity providers by absorbing
-protocol losses before losses impact Senior capital.
+* update bounded underwriting parameters;
+* deny or allow Buyers.
 
-In exchange for elevated risk exposure, Junior liquidity providers receive prioritized
-financing fee participation within the waterfall structure.
+The InvoiceNFT Risk role may:
 
-### Permissions
+* freeze eligible invoices;
+* unfreeze previously frozen invoices.
 
-- Deposit liquidity into the JuniorPool
-- Receive ERC-4626 vault shares
-- Redeem available liquidity not locked in active financing positions
-- Accrue financing yield through waterfall distributions
+These authorities may be assigned to different addresses.
 
 ### Cannot
 
-- Select invoices for financing
-- Control invoice valuation
-- Modify oracle settlement data
-- Withdraw liquidity locked in active financing positions
-- Influence waterfall accounting execution
-
-Junior liquidity providers must not control underwriting or settlement truth, as this
-would compromise protocol neutrality and accounting integrity.
-
-### Main Risks
-
-- First-loss exposure during invoice defaults
-- Junior NAV depletion during bad debt events
-- Liquidity delays caused by locked financing positions
-- Oracle failures or delayed settlement reporting
-- Share price decline from protocol losses
-- Concentration exposure to large Buyer defaults
+* rewrite active financing terms;
+* directly modify tranche NAV;
+* bypass settlement or default accounting;
+* resolve an invoice twice.
 
 ---
 
-## OracleSubmitter
+## 4.6 Senior Liquidity Provider
 
 ### Economic Role
 
-The OracleSubmitter acts as a permissioned off-chain reporting agent responsible for
-synchronizing real-world invoice settlement events with on-chain accounting state
-transitions.
+The Senior Liquidity Provider supplies lower-risk capital to SeniorPool.
 
-Unlike traditional DeFi price oracles, the OracleSubmitter does not provide market
-pricing data. Instead, it reports settlement status, default status, and invoice
-dispute information associated with invoice financing positions.
-
-The OracleSubmitter has the ability to mutate protocol accounting state through
-authorized settlement and default updates, making oracle integrity a critical security
-assumption of the system.
+Senior capital receives recovery priority during default but receives only its configured fee share.
 
 ### Permissions
 
-- Update invoice settlement status
-- Mark invoices as paid, defaulted, or disputed
-- Submit verified off-chain state transitions
-- Trigger settlement-related accounting flows through valid state transitions
-
-### Cannot
-
-- Move LP funds directly
-- Mint or burn liquidity shares
-- Bypass invoice state machine restrictions
-- Rewrite financed principal amounts
-- Modify waterfall accounting logic manually
-- Withdraw protocol liquidity
-- Freeze or unfreeze invoices directly
-
-OracleSubmitters must not have unrestricted administrative control, as oracle compromise
-can economically corrupt protocol accounting integrity.
-
-Freeze and unfreeze authority belongs to Admin / ProtocolOwner or an explicitly
-authorized operational risk role, not to OracleSubmitter.
+* Deposit underlying assets.
+* Receive SeniorPool ERC-4626 shares.
+* Withdraw or redeem available liquidity.
+* Participate in realized financing fee income.
 
 ### Main Risks
 
-- Oracle downtime
-- Malicious settlement reporting
-- Delayed settlement updates
-- Collusion with Suppliers
-- False default reporting
-- Stale invoice state synchronization
-- Legal mismatch between off-chain and on-chain settlement reality
-- Unauthorized accounting state transitions
+* liquidity lock during active financing;
+* residual principal loss after Junior loss allocation;
+* Buyer concentration;
+* oracle failure;
+* ERC-4626 rounding and dust.
+
+Senior capital is protected by Junior capital but is not guaranteed.
 
 ---
 
-## Admin / ProtocolOwner
+## 4.7 Junior Liquidity Provider
 
 ### Economic Role
 
-The Admin / ProtocolOwner is responsible for constrained governance, protocol
-configuration, operational risk management, and emergency coordination procedures.
+The Junior Liquidity Provider supplies first-loss capital to JuniorPool.
 
-Unlike fully permissionless DeFi systems, the protocol assumes limited administrative
-authority to support legal enforceability, oracle coordination, operational freezes,
-and eligibility controls required in real-world receivables financing.
-
-The protocol architecture attempts to minimize direct custodial authority while
-preserving bounded governance capabilities necessary for system integrity and
-operational recovery.
+Junior capital absorbs loss before Senior capital and receives enhanced configured fee participation.
 
 ### Permissions
 
-- Configure protocol eligibility parameters
-- Manage whitelist and blacklist controls
-- Trigger emergency freezes and protocol pauses
-- Freeze or unfreeze invoices through the operational risk process
-- Assign or revoke oracle roles
-- Update bounded system parameters
-- Coordinate operational recovery procedures
-
-### Cannot
-
-- Fabricate settlement events
-- Rewrite historical accounting state
-- Arbitrarily mint LP assets
-- Bypass waterfall accounting execution
-- Seize LP liquidity directly
-- Override invoice state machine invariants
-
-Administrative authority must remain operationally constrained, as unrestricted
-governance control would compromise accounting neutrality and protocol credibility.
+* Deposit underlying assets.
+* Receive JuniorPool ERC-4626 shares.
+* Withdraw or redeem available liquidity.
+* Participate in realized financing fee income.
 
 ### Main Risks
 
-- Admin key compromise
-- Governance capture
-- Abusive operational freezes
-- Parameter misconfiguration
-- Oracle manipulation through governance abuse
-- Excessive protocol centralization
-- Regulatory intervention pressure
-- Censorship risk
-
-RWA protocols intentionally trade a degree of decentralization for legal enforceability
-and operational coordination with off-chain systems.
+* first-loss exposure;
+* NAV depletion;
+* liquidity lock;
+* oracle failure;
+* Buyer concentration;
+* ERC-4626 rounding and dust.
 
 ---
 
-# 2. SPV to Smart Contract Mapping
+## 4.8 Oracle Submitter
 
-## InvoiceFinancingPool.sol → SPV Layer
+### Economic Role
 
-InvoiceFinancingPool.sol acts as the on-chain equivalent of a Special Purpose Vehicle.
+The Oracle Submitter reports off-chain terminal invoice outcomes.
 
-In traditional invoice financing, an SPV holds receivable exposure, finances Suppliers
-against approved invoices, receives repayment flows, and distributes cash according to
-a predefined capital structure.
+Unlike a price oracle, it reports discrete servicing outcomes:
 
-In this protocol, InvoiceFinancingPool.sol performs the same economic role within the
-smart contract system.
+* `SETTLED`;
+* `DEFAULTED`;
+* recovered principal for a default.
 
-The pool finances approved invoices by advancing liquidity to the Supplier. In exchange,
-the pool receives the economic claim to future repayment associated with the financed
-receivable.
+### Permissions
 
-The pool is responsible for:
+* Submit a terminal outcome for a funded invoice.
+* Resubmit an outcome after the prior update was disputed or became stale.
 
-- Locking liquidity into active invoice financing positions
-- Tracking financed principal
-- Tracking invoice maturity and settlement status
-- Receiving oracle-reported repayment outcomes
-- Executing paid and default waterfall logic
-- Releasing locked assets after settlement
-- Recognizing losses when recovery is insufficient
-- Accumulating realized credit losses through `totalBadDebt`
+### Cannot
 
-Legal enforcement and real-world collection actions remain off-chain. The smart contract
-models the financial and accounting consequences of those outcomes, but does not itself
-enforce legal claims.
+* execute settlement or default accounting;
+* move tranche funds;
+* update buyer exposure;
+* mark InvoiceNFT terminal directly;
+* report arbitrary lifecycle states;
+* report non-zero recovery for `SETTLED`;
+* modify finalized outcomes.
 
 ---
 
-## InvoiceNFT.sol → Receivable Claim Representation
+## 4.9 Dispute Administrator
 
-InvoiceNFT.sol represents the receivable claim associated with an approved invoice
-financing position.
+### Economic Role
 
-Each invoice submitted to the protocol is represented by a unique NFT. The NFT is not
-treated as collectible metadata, but as a financial position that tracks invoice
-identity, lifecycle state, financing status, and settlement progression.
+The Dispute Administrator challenges an active oracle update during the dispute window.
 
-The NFT acts as the canonical source of truth for invoice lifecycle state. A single
-invoice identifier must map to a single NFT and a single financing lifecycle.
+### Permissions
 
-This prevents the same invoice from being financed more than once at the state machine
-level, rather than relying on off-chain process controls.
+* Mark an unfinalized oracle update as disputed before the dispute window expires.
 
-InvoiceNFT.sol is responsible for:
+### Cannot
 
-- Representing invoice identity
-- Tracking invoice lifecycle state
-- Linking on-chain invoice state to off-chain invoice references
-- Preserving financing status
-- Preventing double financing of the same invoice
+* finalize an update merely by holding the dispute role;
+* mutate tranche accounting;
+* directly resolve an invoice;
+* modify a finalized update.
 
-InvoiceNFT.sol is not responsible for:
-
-- Holding pooled liquidity
-- Distributing repayment flows
-- Executing waterfall accounting
-- Calculating financing fees
-- Recognizing pool-level bad debt
-
-Those responsibilities belong to InvoiceFinancingPool.sol and the pool accounting layer.
+A disputed update cannot be finalized. A replacement update may later be submitted.
 
 ---
 
-## Lifecycle State vs Accounting State
+## 4.10 Pool Administrator
 
-The protocol separates lifecycle state from accounting state.
+### Economic Role
 
-InvoiceNFT.sol is the canonical source of truth for invoice lifecycle state, including
-invoice identity, current lifecycle state, frozen status, preserved financial state,
-and whether the invoice has already been financed.
+The Pool Administrator configures the immutable oracle trust boundary after deployment.
 
-InvoiceFinancingPool.sol is the canonical source of truth for accounting state,
-including financed principal, funding timestamp, due date, locked assets, fee
-accounting, repayment outcomes, NAV effects, and bad debt recognition.
+### Permissions
 
-Every financing, settlement, default, freeze, and unfreeze operation must update the
-relevant lifecycle and accounting state atomically within a single transaction.
+* Set the InvoiceStatusOracle address once.
 
-If either the lifecycle update or the accounting update cannot be completed, the entire
-transaction must revert.
+### Cannot
 
-This prevents divergence between invoice state and pool accounting.
+* replace the oracle after it has been set;
+* manually set finalized outcomes;
+* directly alter tranche NAV;
+* bypass waterfall execution.
 
 ---
 
-## SeniorPool.sol / JuniorPool.sol → Capital Structure Tranches
+## 4.11 Permissionless Executor
 
-SeniorPool.sol and JuniorPool.sol represent separate capital structure tranches within
-the invoice financing protocol.
+### Economic Role
 
-The SeniorPool provides lower-risk liquidity capital and is designed for liquidity
-providers seeking more stable repayment priority. Senior capital receives priority
-during recovery and default resolution flows, but remains exposed to residual losses
-if Junior capital is fully depleted.
+An executor triggers accounting after an outcome has been finalized.
 
-The JuniorPool provides higher-risk liquidity capital and acts as the first-loss
-tranche of the system. Junior capital absorbs losses before Senior capital is affected,
-providing economic protection to the SeniorPool.
+The executor may be:
 
-In exchange for this elevated risk, Junior liquidity providers receive enhanced upside
-through prioritized financing fee participation in the waterfall structure.
+* the Buyer;
+* a servicing operator;
+* a recovery operator;
+* a keeper;
+* any other address holding the required tokens and approvals.
 
-Both pools are modeled as ERC-4626 vaults. Liquidity providers deposit assets and
-receive vault shares representing proportional ownership of each pool's net asset value.
+### Permissions
 
-If invoice defaults result in pool-level losses, the affected pool NAV is written down
-and ERC-4626 share price naturally reflects that loss.
+* Call `settleInvoice(invoiceId, paidAmount)`.
+* Call `resolveDefault(invoiceId)`.
 
-This tranche structure allows the protocol to separate risk and return profiles while
-preserving deterministic accounting through vault share mechanics.
+### Cannot
 
----
+* choose terminal status;
+* choose recovered principal;
+* alter stored financing terms;
+* override waterfall allocation;
+* resolve an invoice more than once.
 
-## OracleSubmitter → Settlement Reporting Layer
-
-The OracleSubmitter represents the settlement reporting layer of the protocol.
-
-In traditional invoice financing, repayment status, disputes, delays, and default events
-are observed and reported by off-chain servicing, legal, or operational agents.
-
-In this protocol, the OracleSubmitter maps off-chain settlement reality to authorized
-on-chain invoice state transitions.
-
-The OracleSubmitter reports settlement state, but does not own settlement logic.
-
-It may trigger settlement-related flows only through valid state machine transitions.
-It must not bypass invoice lifecycle rules, modify financed principal, change fee
-calculations, or manually alter waterfall accounting.
-
-Oracle integrity is a central trust assumption of the protocol. A stale, malicious, or
-incorrect oracle update can corrupt accounting state, delay bad debt recognition,
-release locked liquidity incorrectly, or cause incorrect NAV updates.
-
-For this reason, oracle permissions must remain narrow, explicit, and constrained by
-the invoice state machine.
+For default execution, the executor must supply exactly the oracle-finalized recovered principal.
 
 ---
 
-## Admin / ProtocolOwner → Operational Governance Layer
+# 5. Contract Architecture
 
-The Admin / ProtocolOwner represents the operational governance layer required for
-real-world invoice financing.
+## 5.1 InvoiceNFT.sol — Lifecycle Registry
 
-RWA systems require bounded administrative authority because invoice eligibility, legal
-disputes, oracle coordination, and emergency procedures depend on off-chain operational
-processes.
+InvoiceNFT represents invoice identity and lifecycle state.
 
-The Admin / ProtocolOwner is responsible for configuring protocol parameters, managing
-eligibility rules, assigning or revoking oracle submitter roles, and triggering
-emergency freezes or protocol pauses when required.
+Each invoice stores:
 
-Admin authority may control protocol operations, but must not rewrite financial outcomes.
+```solidity
+struct Invoice {
+    address supplier;
+    address buyer;
+    uint256 faceValue;
+    uint256 dueDate;
+    uint256 fundedAt;
+    InvoiceStatus status;
+    InvoiceStatus previousStatus;
+}
+```
 
-The Admin / ProtocolOwner must not fabricate settlement events, rewrite historical
-accounting state, bypass waterfall logic, seize LP liquidity, or override invoice state
-machine invariants.
+Supported lifecycle states:
 
-This creates a deliberate trust model: the protocol accepts limited operational authority
-for legal enforceability and emergency response, while constraining that authority from
-becoming unrestricted control over user funds or accounting outcomes.
+```solidity
+enum InvoiceStatus {
+    CREATED,
+    VERIFIED,
+    FUNDED,
+    SETTLED,
+    DEFAULTED,
+    FROZEN
+}
+```
+
+InvoiceNFT is responsible for:
+
+* invoice identity;
+* Supplier and Buyer association;
+* face value and due date;
+* lifecycle transitions;
+* funding timestamp;
+* freeze-state restoration;
+* prevention of repeated lifecycle funding;
+* non-transferability.
+
+InvoiceNFT is not responsible for:
+
+* underwriting calculations;
+* buyer concentration;
+* tranche accounting;
+* repayment token transfers;
+* fee distribution;
+* bad-debt recognition.
+
+Invoice NFTs are non-transferable in v1.
 
 ---
 
-# 3. Invoice NFT State Machine
+## 5.2 RWARiskManager.sol — Underwriting Boundary
 
-The Invoice NFT lifecycle is modeled as a deterministic state machine.
+RWARiskManager controls:
 
-Each invoice may move only through explicitly allowed lifecycle transitions. Invalid
-transitions must revert at the smart contract level and must not rely on off-chain
-process controls.
+* minimum invoice amount;
+* maximum invoice tenor;
+* advance rate;
+* financing fee APR;
+* maximum active exposure per Buyer;
+* Buyer denylist;
+* active Buyer exposure.
 
-The state machine exists to enforce financial correctness, prevent double financing,
-preserve settlement integrity, and make every invoice lifecycle auditable.
+Intrinsic eligibility and portfolio concentration are separate checks.
 
-The core financial states are:
+Intrinsic eligibility evaluates:
 
-- CREATED
-- VERIFIED
-- FUNDED
-- SETTLED
-- DEFAULTED
+* invoice lifecycle status;
+* face value;
+* remaining tenor;
+* Buyer denylist status.
 
-FROZEN is modeled as an operational/legal overlay rather than a final financial state.
-Freezing an invoice must preserve the last valid financial state so that the invoice
-can resume from that state after unfreeze.
+Concentration evaluates whether an additional financed principal amount would exceed the Buyer exposure limit.
 
-A financed invoice must never return to a state where it can be financed again.
-Double financing must be impossible at the state machine level.
+Only InvoiceFinancingPool may update active Buyer exposure.
 
 ---
 
-## CREATED → VERIFIED
+## 5.3 InvoiceFinancingPool.sol — SPV and Accounting Coordinator
+
+InvoiceFinancingPool acts as the on-chain SPV coordinator.
+
+It is responsible for:
+
+* deploying and coordinating SeniorPool and JuniorPool;
+* wrapping LP deposits and withdrawals;
+* financing eligible invoices;
+* storing immutable financing positions;
+* locking tranche liquidity;
+* updating Buyer exposure;
+* advancing principal to Suppliers;
+* recording finalized oracle outcomes;
+* executing settlement;
+* executing default recovery and loss allocation;
+* updating aggregate locked assets;
+* recording cumulative principal bad debt;
+* transitioning InvoiceNFT to terminal states.
+
+It does not replace ERC-4626 tranche accounting.
+
+---
+
+## 5.4 SeniorPool.sol and JuniorPool.sol — ERC-4626 Tranches
+
+Both tranche vaults track:
+
+```text
+accountedAssets
+lockedAssets
+availableLiquidity
+raw token balance
+```
+
+`accountedAssets` is the ERC-4626 NAV source.
+
+`lockedAssets` represents NAV committed to unresolved financed invoices.
+
+```solidity
+availableLiquidity = accountedAssets - lockedAssets;
+```
+
+Financing transfers cash out of the vault but does not immediately reduce NAV because the vault receives economic exposure to the receivable.
+
+Loss is recognized only through an explicit `writeDown()` during default resolution.
+
+---
+
+## 5.5 InvoiceStatusOracle.sol — Off-Chain Outcome Adapter
+
+The oracle stores:
+
+```solidity
+struct StatusUpdate {
+    uint256 invoiceId;
+    IInvoiceNFT.InvoiceStatus newStatus;
+    uint256 recoveredAmount;
+    uint256 submittedAt;
+    bool disputed;
+    bool finalized;
+}
+```
+
+It supports:
+
+* permissioned submission;
+* dispute administration;
+* dispute-window delay;
+* maximum staleness;
+* stale or disputed resubmission;
+* permissionless finalization;
+* immutable finalized outcomes;
+* pool callback propagation.
+
+The oracle does not execute financial accounting.
+
+---
+
+# 6. Invoice Lifecycle State Machine
+
+## 6.1 CREATED → VERIFIED
 
 ### Trigger
 
-An authorized Admin or OracleSubmitter confirms that the submitted invoice is eligible
-for financing.
+An address holding `VERIFIER_ROLE` calls `verify(invoiceId)`.
 
-This verification represents protocol acceptance that the invoice corresponds to a valid
-off-chain receivable and may enter the financing lifecycle.
+### Guards
 
-### Guard
+* Invoice exists.
+* Current status is `CREATED`.
 
-- Invoice must exist
-- Invoice must be in CREATED state
-- Invoice must not already be verified
-- Invoice must not already be financed
-- Supplier must be eligible
-- Buyer must be eligible
-- Invoice reference must be unique
-- Invoice must represent an accepted unpaid receivable
+### Effects
 
-### Accounting Effects
-
-- Invoice state changes from CREATED to VERIFIED
-- Invoice becomes eligible for funding
-- No liquidity is moved
-- No locked assets are created
-
-### Event
-
-```solidity
-event InvoiceVerified(
-    uint256 indexed invoiceId,
-    address indexed supplier,
-    address indexed buyer
-);
-```
-
-### Failure Mode Prevented
-
-This transition prevents invalid, duplicated, disputed, or unaccepted invoices from
-entering the financing lifecycle.
-
-A non-verified invoice must never be eligible for funding.
+* Status becomes `VERIFIED`.
+* No liquidity moves.
+* No financing position exists.
+* No Buyer exposure is created.
 
 ---
 
-## VERIFIED → FUNDED
+## 6.2 VERIFIED → FUNDED
 
 ### Trigger
 
-The Supplier requests financing against a verified invoice, and the InvoiceFinancingPool
-advances liquidity to the Supplier in exchange for the economic claim to future invoice
-repayment.
-
-This transition represents the moment when the invoice becomes an active financing
-position and protocol liquidity becomes locked until settlement, default resolution,
-or recovery.
-
-### Guard
-
-- Invoice must exist
-- Invoice must be in VERIFIED state
-- Invoice must not already be funded
-- Invoice must not be frozen
-- Protocol must not be paused
-- Principal must be greater than zero
-- Advance amount must respect the maximum advance rate
-- Pool must have enough available liquidity in both required tranches
-- Invoice due date must be in the future
-- Invoice reference must remain unique
-- Supplier and Buyer must remain eligible
-
-### Accounting Effects
-
-- Invoice state changes from VERIFIED to FUNDED
-- Financed principal is recorded
-- Senior financed principal is recorded
-- Junior financed principal is recorded
-- Funding timestamp is recorded
-- Invoice due date is recorded
-- Senior locked assets increase by the senior financed principal
-- Junior locked assets increase by the junior financed principal
-- Available liquidity decreases by the financed principal
-- Supplier receives the advance liquidity
-
-### Event
+The recorded Supplier calls:
 
 ```solidity
-event InvoiceFunded(
-    uint256 indexed invoiceId,
-    address indexed supplier,
-    uint256 principal,
-    uint256 seniorPrincipal,
-    uint256 juniorPrincipal,
-    uint256 fundedAt,
-    uint256 dueDate
-);
+financeInvoice(invoiceId)
 ```
 
-### Failure Mode Prevented
+on InvoiceFinancingPool.
 
-This transition prevents unverified invoices, duplicated invoices, expired invoices,
-frozen invoices, or underfunded pool states from becoming active financing positions.
+### Guards
 
-It also prevents the protocol from advancing liquidity without recording the
-corresponding locked asset and financing obligation.
+* Caller is the recorded Supplier.
+* Financing position does not already exist.
+* Invoice passes intrinsic eligibility.
+* Buyer concentration remains within limits.
+* SeniorPool has sufficient available liquidity.
+* JuniorPool has sufficient available liquidity.
+* InvoiceNFT remains in `VERIFIED`.
+
+### Effects
+
+The pool:
+
+1. calculates financed principal;
+2. calculates the Senior and Junior principal split;
+3. calculates and stores the financing fee;
+4. stores the financing position;
+5. increases aggregate locked assets;
+6. locks Senior and Junior liquidity independently;
+7. increases active Buyer exposure;
+8. marks InvoiceNFT as `FUNDED`;
+9. transfers tranche cash to the Supplier.
+
+All effects occur atomically. Any failure reverts the entire transaction.
 
 ---
 
-## FUNDED → SETTLED
+## 6.3 FUNDED → SETTLED
 
-### Trigger
+Settlement has two distinct stages:
 
-An authorized OracleSubmitter reports that the Buyer has paid the financed invoice and
-that the repayment amount is sufficient to fully settle the financing position.
+### Stage 1 — Oracle Outcome Finalization
 
-This transition represents the successful completion of the invoice financing lifecycle.
+The Oracle Submitter submits:
 
-### Guard
+```text
+status = SETTLED
+recoveredAmount = 0
+```
 
-- Invoice must exist
-- Invoice must be in FUNDED state
-- Invoice must not be frozen
-- Settlement must not already be executed
-- Caller must be an authorized OracleSubmitter or Admin-controlled settlement role
-- Reported paid amount must be greater than or equal to financed principal plus financing fee
-- Partial settlement is not supported in v1: if reported payment is less than expected repayment, the invoice cannot transition to SETTLED and must be resolved through the default path using the reported amount as recovered amount
+The update passes through the dispute and staleness process.
 
-### Accounting Effects
+A permissionless caller finalizes the oracle update.
 
-- Invoice state changes from FUNDED to SETTLED
-- Invoice is no longer an active financing position
-- Locked liquidity is released
-- Senior locked assets decrease by the senior financed principal
-- Junior locked assets decrease by the junior financed principal
-- Financing fee is calculated
-- Principal is restored to the pool accounting system
-- Financing fee is distributed according to the paid-path waterfall
-- Any surplus above principal and financing fee is returned to the Supplier
-- Settlement timestamp is recorded as `block.timestamp` at the time of the on-chain settlement call; oracle-reported off-chain timestamps are not used for protocol accounting
-- Invoice cannot be funded, defaulted, or frozen again as an active position
+InvoiceFinancingPool records the finalized outcome but does not yet:
 
-### Event
+* release locked liquidity;
+* transfer repayment assets;
+* distribute fees;
+* reduce Buyer exposure;
+* mutate `InvoiceNFT` or mark it terminal.
+
+After finalization and before accounting execution, the current `InvoiceNFT` status may be `FUNDED`, or `FROZEN` with `previousStatus` equal to `FUNDED`. If the invoice is `FROZEN`, finalization remains recorded but settlement execution is blocked until unfreeze.
+
+### Stage 2 — Settlement Accounting Execution
+
+A permissionless payer calls:
 
 ```solidity
-event InvoiceSettled(
-    uint256 indexed invoiceId,
-    uint256 paidAmount,
-    uint256 principal,
-    uint256 financingFee,
-    uint256 juniorFee,
-    uint256 seniorFee,
-    uint256 settledAt
-);
+settleInvoice(invoiceId, paidAmount)
 ```
 
-### Failure Mode Prevented
+### Guards
 
-This transition prevents Suppliers, Buyers, or unauthorized actors from falsely marking
-invoices as paid.
+* Financing position exists.
+* Position is unresolved.
+* Oracle outcome is finalized.
+* Finalized status is `SETTLED`.
+* Finalized recovery is zero.
+* InvoiceNFT status is still `FUNDED`.
+* Invoice is not `FROZEN`.
+* `paidAmount >= principal + financingFee`.
 
-It also prevents double settlement, premature liquidity release, incorrect fee
-distribution, and accounting corruption caused by settling invoices that are not active
-funded positions.
+### Effects
+
+The pool:
+
+1. marks the financing position resolved;
+2. decreases aggregate locked assets by principal;
+3. transfers Senior principal plus Senior fee to SeniorPool;
+4. transfers Junior principal plus Junior fee to JuniorPool;
+5. returns surplus to the Supplier;
+6. unlocks Senior and Junior principal;
+7. credits realized fee income to tranche NAV;
+8. decreases Buyer exposure by principal;
+9. marks InvoiceNFT as `SETTLED`.
+
+`totalBadDebt` does not change.
 
 ---
 
-## FUNDED → DEFAULTED
+## 6.4 FUNDED → DEFAULTED
 
-### Trigger
+Default also has two distinct stages.
 
-An authorized OracleSubmitter reports that the financed invoice failed to settle by
-its due date or has become legally, operationally, or economically unrecoverable.
+### Stage 1 — Oracle Outcome Finalization
 
-This transition represents failure of the financed receivable to repay the protocol
-according to the expected settlement terms.
+The Oracle Submitter submits:
 
-### Guard
+```text
+status = DEFAULTED
+recoveredAmount = recovered principal
+```
 
-- Invoice must exist
-- Invoice must be in FUNDED state
-- Invoice must not be frozen
-- Caller must be an authorized OracleSubmitter or Admin-controlled default role
-- Default must not already be executed
-- Settlement must not already be executed
-- Invoice due date must have passed, or an authorized dispute/default reason must exist
-- Recovered amount must be less than or equal to the expected repayment amount
+### Oracle Recovery Rules
 
-### Accounting Effects
+* Recovery may be zero.
+* Recovery must not exceed financed principal.
+* Recovery represents principal only.
+* Financing-fee recovery during default is outside v1 scope.
 
-- Invoice state changes from FUNDED to DEFAULTED
-- Invoice becomes a terminal defaulted financing position
-- Locked liquidity is released from the active financing bucket
-- Senior locked assets decrease by the senior financed principal
-- Junior locked assets decrease by the junior financed principal
-- Expected repayment is calculated as financed principal plus financing fee
-- Loss is calculated as expected repayment minus recovered amount
-- Recovered amount is distributed according to the default-path waterfall
-- JuniorPool absorbs first-loss exposure through NAV writedown
-- SeniorPool absorbs residual loss if JuniorPool NAV is insufficient
-- `totalBadDebt` increases by the realized credit loss recognized by the protocol
-- Invoice cannot be settled, funded, or defaulted again
+The update passes through the dispute and staleness process.
 
-### Event
+A permissionless caller finalizes the update.
+
+InvoiceFinancingPool records:
+
+* finalized `DEFAULTED` status;
+* finalized recovered principal.
+
+The callback requires an existing financing position.
+
+Finalization does not change `InvoiceNFT` status or mark it terminal. After finalization and before accounting execution, the current status may be `FUNDED`, or `FROZEN` with `previousStatus` equal to `FUNDED`. If the invoice is `FROZEN`, finalization remains recorded but default execution is blocked until unfreeze.
+
+### Stage 2 — Default Accounting Execution
+
+A permissionless executor calls:
 
 ```solidity
-event InvoiceDefaulted(
-    uint256 indexed invoiceId,
-    uint256 recoveredAmount,
-    uint256 lossAmount,
-    uint256 juniorLoss,
-    uint256 seniorLoss,
-    uint256 defaultedAt
-);
+resolveDefault(invoiceId)
 ```
 
-### Failure Mode Prevented
+The function accepts no recovery argument.
 
-This transition prevents defaulted invoices from remaining indefinitely as active
-financing positions and prevents losses from being hidden outside pool accounting.
+### Guards
 
-It also prevents unauthorized actors from declaring defaults, prevents double default
-execution, and ensures that bad debt recognition follows the defined waterfall order.
+* Financing position exists.
+* Position is unresolved.
+* Oracle outcome is finalized.
+* Finalized status is `DEFAULTED`.
+* InvoiceNFT status is still `FUNDED`.
+* Invoice is not `FROZEN`.
+* Stored finalized recovery does not exceed stored principal.
+
+### Effects
+
+The pool:
+
+1. reads `finalizedRecoveryAmount[invoiceId]`;
+2. calculates Senior recovery;
+3. calculates Junior recovery;
+4. calculates Junior loss;
+5. calculates Senior loss;
+6. calculates realized principal bad debt;
+7. marks the position resolved;
+8. decreases aggregate locked assets;
+9. increases cumulative bad debt;
+10. transfers recovered assets to the tranche vaults;
+11. unlocks Senior and Junior principal;
+12. writes down Junior NAV first;
+13. writes down Senior NAV for residual loss;
+14. decreases Buyer exposure;
+15. marks InvoiceNFT as `DEFAULTED`.
+
+The executor cannot change the recovery amount.
 
 ---
 
-## FROZEN Overlay
+## 6.5 FROZEN Overlay
 
-### Concept
+`FROZEN` is an operational and legal overlay represented as an InvoiceNFT lifecycle status.
 
-FROZEN is not modeled as a terminal financial state.
+An invoice may be frozen only from:
 
-FROZEN represents an operational, legal, or risk-control overlay applied to an invoice
-that is otherwise in a valid financial lifecycle state.
+* `VERIFIED`;
+* `FUNDED`.
 
-An invoice may be frozen only from VERIFIED or FUNDED state.
+When frozen:
 
-Freezing an invoice must preserve the last valid financial state so that, after
-unfreeze, the invoice resumes from the same lifecycle position.
+* current status becomes `FROZEN`;
+* prior status is stored in `previousStatus`;
+* no principal changes;
+* no NAV changes;
+* no fee is realized;
+* no Buyer exposure changes;
+* no locked assets are released;
+* financing is blocked;
+* settlement execution is blocked;
+* default execution is blocked.
 
-This prevents freeze/unfreeze operations from resetting invoice economics, reopening
-financing eligibility, or bypassing settlement/default rules.
+An oracle update submitted before the freeze may still be finalized because oracle finalization does not execute accounting or mutate InvoiceNFT.
 
-### Allowed Freeze Sources
+Accounting execution remains blocked until unfreeze.
 
-- VERIFIED → FROZEN overlay
-- FUNDED → FROZEN overlay
+---
 
-### Not Allowed
+## 6.6 FROZEN → Previous Status
 
-- CREATED invoices cannot be frozen
-- SETTLED invoices cannot be frozen
-- DEFAULTED invoices cannot be frozen
-- FROZEN must not be used to reset invoice lifecycle state
-- FROZEN must not allow a funded invoice to become fundable again
+An address holding the InvoiceNFT Risk role may unfreeze an invoice.
 
-### Trigger
+The invoice returns to its stored previous status:
 
-An authorized Admin or operational risk role freezes an invoice due to legal dispute,
-suspected fraud, oracle uncertainty, compliance concern, or operational investigation.
+* `VERIFIED`; or
+* `FUNDED`.
 
-OracleSubmitter cannot directly freeze invoices.
+Unfreeze must not change economic accounting.
 
-### Guard
+---
 
-- Invoice must exist
-- Invoice must be in VERIFIED or FUNDED state
-- Invoice must not already be frozen
-- Caller must be authorized Admin or operational risk role
-- Freeze reason must be recorded
+## 6.7 Terminal States
 
-### Accounting Effects
+`SETTLED` and `DEFAULTED` are terminal.
 
-- `isFrozen` is set to true
-- Last valid financial state is preserved
-- No financing fee is distributed
-- No settlement waterfall is executed
-- No default waterfall is executed
-- No liquidity is released merely because of freeze
-- If invoice is FUNDED, locked assets remain locked
+After either transition, the invoice cannot:
 
-### Event
+* be funded again;
+* settle again;
+* default again;
+* be frozen;
+* return to an earlier lifecycle state.
+
+---
+
+## 6.8 Forbidden Transitions
+
+The following transitions must be impossible:
+
+* `CREATED → FUNDED`
+* `CREATED → SETTLED`
+* `CREATED → DEFAULTED`
+* `CREATED → FROZEN`
+* `VERIFIED → SETTLED`
+* `VERIFIED → DEFAULTED`
+* `FUNDED → CREATED`
+* `FUNDED → VERIFIED`
+* `FROZEN → SETTLED` without unfreeze
+* `FROZEN → DEFAULTED` without unfreeze
+* `SETTLED → any state`
+* `DEFAULTED → any state`
+* any invoice becoming `FUNDED` more than once
+* settlement after default
+* default after settlement
+
+---
+
+# 7. Underwriting and Financing Model
+
+## 7.1 Risk Parameters
+
+The v1 Risk Manager stores:
 
 ```solidity
-event InvoiceFrozen(
-    uint256 indexed invoiceId,
-    uint8 previousFinancialState,
-    string reason,
-    uint256 frozenAt
-);
+struct RiskParams {
+    uint256 maxExposurePerBuyer;
+    uint256 advanceRate;
+    uint256 maxInvoiceTenor;
+    uint256 minInvoiceAmount;
+    uint256 financingFeeApr;
+}
 ```
 
-### Failure Mode Prevented
-
-The freeze overlay prevents disputed, suspicious, or operationally uncertain invoices
-from continuing through financing, settlement, or default flows until the issue is
-resolved.
-
-It also prevents legal or operational intervention from corrupting financial state.
-
----
-
-## UNFREEZE Overlay
-
-### Trigger
-
-An authorized Admin or operational risk role resolves the freeze reason and restores
-the invoice to its preserved financial state.
-
-OracleSubmitter cannot directly unfreeze invoices.
-
-### Guard
-
-- Invoice must exist
-- Invoice must be frozen
-- Caller must be authorized Admin or operational risk role
-- Preserved financial state must be VERIFIED or FUNDED
-- Freeze reason must be resolved
-
-### Accounting Effects
-
-- `isFrozen` is set to false
-- Invoice resumes from the preserved financial state
-- No principal, fee, NAV, or locked liquidity accounting is changed merely by unfreeze
-- If the preserved state was VERIFIED, the invoice may continue toward funding
-- If the preserved state was FUNDED, the invoice may continue toward settlement or default
-
-### Event
+Basis-point values use:
 
 ```solidity
-event InvoiceUnfrozen(
-    uint256 indexed invoiceId,
-    uint8 restoredFinancialState,
-    uint256 unfrozenAt
-);
+BPS_DENOMINATOR = 10_000
 ```
 
-### Failure Mode Prevented
-
-Unfreeze prevents operational freezes from becoming permanent accounting deadlocks
-while ensuring that freeze resolution cannot reset financial history, reopen
-settled/defaulted invoices, or bypass normal lifecycle transitions.
+Risk parameters are bounded by implementation-level validation.
 
 ---
 
-## Terminal States
+## 7.2 Intrinsic Eligibility
 
-SETTLED and DEFAULTED are terminal financial states.
+An invoice is intrinsically eligible only when:
 
-Once an invoice reaches SETTLED, it represents a successfully completed financing
-lifecycle. The invoice must not be funded, defaulted, frozen, or settled again.
+* status is `VERIFIED`;
+* face value meets the minimum;
+* due date is in the future;
+* remaining tenor is within the configured maximum;
+* Buyer is not denied.
 
-Once an invoice reaches DEFAULTED, it represents a completed default resolution
-lifecycle. The invoice must not be funded, settled, frozen, or defaulted again.
-
-Terminal states exist to prevent double settlement, double default execution, liquidity
-re-release, bad debt manipulation, and reopening of completed financial positions.
-
----
-
-## Forbidden Transitions
-
-The following transitions must be impossible at the smart contract level:
-
-- CREATED → FUNDED
-- CREATED → SETTLED
-- CREATED → DEFAULTED
-- CREATED → FROZEN
-- VERIFIED → SETTLED
-- VERIFIED → DEFAULTED
-- FUNDED → VERIFIED
-- FUNDED → CREATED
-- SETTLED → any state
-- DEFAULTED → any state
-- FROZEN → SETTLED without unfreeze
-- FROZEN → DEFAULTED without unfreeze
-- FROZEN → FUNDED if the preserved state was already FUNDED
-- Any invoice → FUNDED more than once
-
-These forbidden transitions enforce that invoice financing is linear, auditable, and
-irreversible after settlement or default.
-
-State machine correctness must not depend on frontend behavior, off-chain operators,
-or manual process discipline. Invalid transitions must revert inside the smart contract.
+A non-existent invoice returns false from the Risk Manager eligibility query.
 
 ---
 
-## State Machine Invariants
+## 7.3 Buyer Concentration
 
-- Only VERIFIED invoices may be funded.
-- Only FUNDED invoices may be settled.
-- Only FUNDED invoices may be defaulted.
-- SETTLED invoices are terminal.
-- DEFAULTED invoices are terminal.
-- A funded invoice must never become fundable again.
-- An invoice must never be financed more than once.
-- Freeze and unfreeze operations must not change principal, fee, NAV, or locked liquidity accounting.
-- A frozen invoice must resume from its preserved financial state after unfreeze.
-- Settlement and default execution must be mutually exclusive.
-
----
-
-# 4. Financing Fee Model
-
-The protocol charges a financing fee for advancing liquidity to Suppliers before
-invoice maturity.
-
-The financing fee compensates liquidity providers for committing capital to illiquid
-invoice financing positions and taking payment delay, default, and liquidity mismatch
-risk.
-
-Without a financing fee model, the system would behave like an escrow service rather
-than a credit protocol.
-
-## Fee Formula
-
-The v1 protocol uses a fixed APR model applied linearly over the full invoice tenure.
+Buyer concentration is checked separately from intrinsic eligibility.
 
 ```solidity
-financingFee = principal * aprBps * (dueDate - fundedAt) / 365 days / 10_000;
+existingExposure + newPrincipal <= maxExposurePerBuyer
 ```
 
-Where:
+Exposure represents active financed principal, not:
 
-- `principal` is the financed amount advanced to the Supplier
-- `aprBps` is the annualized financing rate expressed in basis points
-- `fundedAt` is the timestamp when the invoice becomes funded
-- `dueDate` is the expected invoice maturity date
-- `dueDate - fundedAt` is the invoice financing duration
-- `365 days` resolves to `31_536_000` seconds; leap years are ignored in v1
+* invoice face value;
+* expected repayment;
+* lifetime financing volume;
+* financing fee.
 
-## APR Configuration
-
-`aprBps` is a protocol-level configuration parameter in v1.
-
-It may be updated by Admin only within bounded governance limits.
-
-Future versions may support per-Buyer, per-invoice, or risk-adjusted APR models.
-
-## Early Settlement Treatment
-
-The v1 protocol calculates financing fee using the full invoice tenor from `fundedAt`
-to `dueDate`.
-
-Early repayment does not reduce the financing fee in v1.
-
-This makes the fee deterministic at funding time and avoids settlement-time fee
-ambiguity.
-
-## Model Assumptions
-
-The v1 fee model intentionally uses simple linear APR rather than compounding.
-
-This is acceptable because invoice financing positions have fixed maturities, defined
-tenors, and do not continuously roll interest like open-ended lending markets.
-
-The fee is known at funding time and can be deterministically calculated from
-principal, APR, funding timestamp, and due date.
-
-## Accounting Treatment
-
-The financing fee is not paid upfront.
-
-It is realized during settlement when the Buyer repayment is reported and the invoice
-transitions from FUNDED to SETTLED.
-
-Upon successful settlement:
-
-- Principal releases locked liquidity
-- Financing fee is distributed through the paid-path waterfall
-- JuniorPool receives its configured fee share
-- SeniorPool receives the remaining fee according to the waterfall rules
-- Any surplus above principal and financing fee is returned to the Supplier
-
-If the invoice defaults, unrealized financing fee may not be fully collected. Default
-handling is governed by the default-path waterfall.
+Exposure increases during financing and decreases only after successful settlement or default resolution.
 
 ---
 
-# 5. Waterfall Logic
+## 7.4 Advance Calculation
 
-Waterfall logic defines the deterministic order in which repayment cash flows, fees,
-recoveries, and losses are allocated between protocol participants.
-
-The protocol uses different waterfall rules for successful settlement and default
-resolution.
-
-Waterfall execution must be rule-based and must not depend on discretionary decisions
-from Suppliers, Buyers, LPs, OracleSubmitters, or Admins.
-
-The purpose of waterfall logic is to make repayment and loss allocation explicit,
-auditable, and resistant to manipulation.
-
-## Paid Path
-
-The paid path is executed when a funded invoice is reported as fully paid and
-transitions from FUNDED to SETTLED.
-
-Expected repayment is defined as:
+Financed principal is:
 
 ```solidity
-expectedRepayment = principal + financingFee;
+principal =
+    faceValue * advanceRateBps / 10_000;
 ```
-
-If the reported paid amount exceeds expected repayment, the surplus is returned to
-the Supplier:
-
-```solidity
-surplus = paidAmount - expectedRepayment;
-```
-
-## Fee Split
-
-The v1 protocol uses a fixed financing fee split between JuniorPool and SeniorPool.
-
-```solidity
-juniorFee = financingFee * juniorFeeShareBps / 10_000;
-seniorFee = financingFee - juniorFee;
-```
-
-The following invariant must always hold:
-
-```solidity
-juniorFeeShareBps + seniorFeeShareBps == 10_000;
-```
-
-JuniorPool receives enhanced relative upside because it absorbs first-loss exposure.
-
-SeniorPool receives the remaining fee participation in exchange for providing lower-risk,
-repayment-priority capital.
-
-Fee share parameters are protocol-level configuration values and may only be updated
-by Admin within bounded governance limits.
-
-## Paid-Path Allocation
-
-Repayment allocation follows this order:
-
-1. Financed principal releases locked liquidity
-2. `juniorFee` is distributed to JuniorPool
-3. `seniorFee` is distributed to SeniorPool
-4. Any surplus above principal and financing fee is returned to the Supplier
-
-The paid-path waterfall ensures that LP yield is earned only when repayment is actually
-realized.
-
-## Default Path
-
-The default path is executed when a funded invoice fails to fully settle and transitions
-from FUNDED to DEFAULTED.
-
-Default resolution allocation follows this order:
-
-1. Recovered amount is allocated to SeniorPool first
-2. Unrecovered loss is absorbed by JuniorPool first through NAV writedown
-3. If JuniorPool NAV is insufficient, SeniorPool absorbs the residual loss
-4. Realized credit losses are recorded in `totalBadDebt`
-
-JuniorPool acts as the first-loss tranche and protects SeniorPool until Junior capital
-is depleted.
-
-SeniorPool is protected by JuniorPool but is not risk-free. Extreme defaults,
-concentrated Buyer exposure, or insufficient Junior capital can still result in
-SeniorPool losses.
-
-`totalBadDebt` tracks cumulative realized credit losses recognized by the protocol.
-It is a protocol-level accounting metric and must not be reset during normal protocol
-operation.
-
-Per-tranche loss attribution is available through `InvoiceDefaulted` event logs, which
-record `juniorLoss` and `seniorLoss` separately for each default event.
-
-## Partial Payment Handling
-
-Partial settlement states are not supported in v1.
-
-If `paidAmount` is less than `expectedRepayment`, the invoice cannot transition to
-SETTLED.
-
-The invoice must be resolved through the default path, with the reported amount treated
-as `recoveredAmount`.
-
-This keeps the state machine deterministic and avoids introducing a separate
-PARTIALLY_SETTLED state in v1.
-
-## Waterfall Invariants
-
-- Paid-path execution must happen only once per invoice.
-- Default-path execution must happen only once per invoice.
-- Settlement and default execution must be mutually exclusive.
-- JuniorPool receives its configured fee share in the paid path.
-- SeniorPool receives its configured remaining fee share in the paid path.
-- JuniorPool absorbs first-loss exposure in the default path.
-- SeniorPool receives recovery priority in the default path.
-- SeniorPool absorbs losses only after JuniorPool is depleted.
-- `totalBadDebt` must never decrease during normal protocol operation.
-- Waterfall execution must not be manually overridden by Admin or OracleSubmitter.
-- Waterfall accounting must be deterministic for the same input values.
 
 ---
 
-# 6. Pool Token Architecture
+## 7.5 Tranche Principal Split
 
-The protocol uses ERC-4626 vaults for both SeniorPool and JuniorPool.
+Principal is divided as:
 
-Each pool accepts liquidity deposits and issues vault shares representing proportional
-ownership of that pool's net asset value.
+```solidity
+seniorPrincipal =
+    principal * seniorFundingShareBps / 10_000;
 
-This design makes LP accounting explicit, composable, and consistent with existing
-DeFi vault standards.
+juniorPrincipal =
+    principal - seniorPrincipal;
+```
 
-## SeniorPool
+Any integer rounding remainder is allocated to JuniorPool.
 
-SeniorPool represents the lower-risk capital tranche.
+The following must always hold:
 
-Senior liquidity providers deposit assets into the SeniorPool and receive ERC-4626
-shares representing ownership of SeniorPool NAV.
+```solidity
+seniorPrincipal + juniorPrincipal == principal;
+```
 
-SeniorPool receives repayment priority during default resolution flows, but may still
-absorb residual losses if JuniorPool capital is fully depleted.
-
-## JuniorPool
-
-JuniorPool represents the higher-risk first-loss capital tranche.
-
-Junior liquidity providers deposit assets into the JuniorPool and receive ERC-4626
-shares representing ownership of JuniorPool NAV.
-
-JuniorPool absorbs first-loss exposure during default events and receives prioritized
-financing fee participation during successful settlement.
-
-## NAV and Share Price
-
-Pool losses are reflected through NAV writedowns.
-
-When a pool absorbs loss, its accounting total assets decrease. Because ERC-4626 share
-price is derived from total assets divided by total shares, losses naturally reduce
-share price without requiring a separate LP accounting system.
-
-This is the core reason ERC-4626 is used in this architecture.
-
-The protocol does not need to manually track each LP's loss allocation. LP exposure
-is represented through vault share ownership.
-
-## NAV Writedown Mechanism
-
-NAV writedowns are executed through restricted pool accounting functions callable
-only by InvoiceFinancingPool during default resolution.
-
-These functions reduce pool-accounted assets without burning LP shares, causing
-ERC-4626 share price to reflect realized losses.
-
-Pool writedown functions must not be callable by Suppliers, Buyers, LPs,
-OracleSubmitters, or arbitrary Admin actions outside the defined default resolution
-flow.
-
-This ensures that losses become visible through vault share price while preventing
-discretionary manipulation of LP balances.
-
-## Design Tradeoff
-
-Using ERC-4626 introduces known share price manipulation risks, especially when vaults
-are small or early in their lifecycle.
-
-For this portfolio implementation, this tradeoff is accepted and documented.
-
-The protocol prioritizes clear vault-based accounting, composability, and consistency
-with the previous lending protocol architecture over building a custom share accounting
-system.
-
-Future production versions would require additional mitigations such as:
-
-- Minimum initial liquidity
-- Virtual shares / virtual assets
-- Deposit caps during early pool bootstrap
-- Stricter oracle and settlement controls
-- Withdrawal queue mechanics
+Funding requires sufficient available liquidity in both tranches independently.
 
 ---
 
-# 7. Liquidity Architecture
+# 8. Financing Fee Model
+
+## 8.1 Formula
+
+The v1 financing fee uses simple linear APR:
+
+```solidity
+financingFee =
+    principal
+    * financingFeeAprBps
+    * (dueDate - fundedAt)
+    / (365 days * 10_000);
+```
+
+The fee is calculated and stored when the invoice is funded.
+
+---
+
+## 8.2 Fixed-Tenor Treatment
+
+The full funded-to-due-date tenor is used.
+
+Early settlement does not reduce the fee.
+
+This makes the fee deterministic and prevents settlement-time repricing.
+
+---
+
+## 8.3 Settlement Recognition
+
+The fee is not recognized as tranche NAV at funding.
+
+It becomes realized only during successful settlement.
+
+The stored fee is divided as:
+
+```solidity
+juniorFee =
+    financingFee * juniorFeeShareBps / 10_000;
+
+seniorFee =
+    financingFee - juniorFee;
+```
+
+The following must hold:
+
+```solidity
+juniorFee + seniorFee == financingFee;
+```
+
+---
+
+## 8.4 Default Treatment
+
+Unpaid financing fee is not included in `totalBadDebt`.
+
+The fee represents unrealized expected income, not deployed principal NAV.
+
+Therefore:
+
+```solidity
+principalLoss =
+    principal - recoveredPrincipal;
+```
+
+and:
+
+```solidity
+totalBadDebtDelta =
+    principalLoss;
+```
+
+If principal is fully recovered but the financing fee is not paid, the default path may resolve with:
+
+```text
+recoveredPrincipal = principal
+principalLoss = 0
+totalBadDebtDelta = 0
+```
+
+Fee recovery during default is not modeled in v1.
+
+---
+
+# 9. Oracle Outcome Protocol
+
+## 9.1 Allowed Outcomes
+
+The oracle may submit only:
+
+* `SETTLED`;
+* `DEFAULTED`.
+
+All other InvoiceNFT statuses are invalid oracle outcomes.
+
+---
+
+## 9.2 Submission Requirements
+
+An outcome may be submitted only while InvoiceNFT status is `FUNDED`.
+
+For `SETTLED`:
+
+```solidity
+recoveredAmount == 0
+```
+
+For `DEFAULTED`:
+
+```solidity
+0 <= recoveredAmount <= financedPrincipal
+```
+
+The upper principal bound is validated by InvoiceFinancingPool when the oracle callback is finalized.
+
+---
+
+## 9.3 Active Update Rules
+
+An active non-disputed, non-stale update cannot be overwritten.
+
+Resubmission is allowed only when the previous update:
+
+* was disputed; or
+* became stale.
+
+A replacement update may change:
+
+* terminal status;
+* recovered principal.
+
+---
+
+## 9.4 Dispute Window
+
+A Dispute Administrator may dispute an update while `block.timestamp <= submittedAt + DISPUTE_WINDOW`.
+
+At the exact dispute-window boundary, both dispute and finalization are timing-valid, but only the first executed transaction succeeds. The later transaction reverts because the update is already disputed or finalized.
+
+A disputed update cannot be finalized.
+
+---
+
+## 9.5 Maximum Staleness
+
+Finalization remains allowed while `block.timestamp <= submittedAt + MAX_STALENESS`, including at the exact maximum-staleness boundary.
+
+After that boundary, finalization reverts because the update is stale and must be replaced.
+
+The configured maximum staleness must exceed the dispute window.
+
+---
+
+## 9.6 Permissionless Finalization
+
+Any address may finalize a valid update while `block.timestamp >= submittedAt + DISPUTE_WINDOW` and `block.timestamp <= submittedAt + MAX_STALENESS`.
+
+Finalization:
+
+1. marks the oracle update finalized;
+2. calls `InvoiceFinancingPool.onStatusFinalized(...)`;
+3. emits the finalized outcome and finalization timestamp.
+
+If the pool callback reverts, the entire transaction reverts, including the oracle's local `finalized` update.
+
+---
+
+## 9.7 Pool Callback Validation
+
+InvoiceFinancingPool independently validates:
+
+* oracle is configured;
+* caller is the configured oracle;
+* status is `SETTLED` or `DEFAULTED`;
+* financing position exists;
+* outcome is not already finalized;
+* `SETTLED` recovery equals zero;
+* `DEFAULTED` recovery does not exceed stored principal.
+
+The finalized status and recovery then become immutable pool state.
+
+---
+
+# 10. Paid-Path Waterfall
+
+Expected repayment is:
+
+```solidity
+expectedRepayment =
+    principal + financingFee;
+```
+
+Settlement requires:
+
+```solidity
+paidAmount >= expectedRepayment;
+```
+
+Surplus is:
+
+```solidity
+surplus =
+    paidAmount - expectedRepayment;
+```
+
+Repayment is allocated as:
+
+```solidity
+seniorRepayment =
+    seniorPrincipal + seniorFee;
+
+juniorRepayment =
+    juniorPrincipal + juniorFee;
+```
+
+Execution order:
+
+1. close local position accounting;
+2. transfer Senior repayment to SeniorPool;
+3. transfer Junior repayment to JuniorPool;
+4. transfer surplus to the Supplier;
+5. unlock Senior principal;
+6. unlock Junior principal;
+7. credit Senior fee to Senior NAV;
+8. credit Junior fee to Junior NAV;
+9. decrease Buyer exposure;
+10. mark InvoiceNFT `SETTLED`.
+
+Principal is not credited to NAV again because it remained part of `accountedAssets` while deployed.
+
+Only incremental fee income increases tranche NAV.
+
+---
+
+# 11. Default-Path Waterfall
+
+## 11.1 Recovery Allocation
+
+Recovered principal is allocated to SeniorPool first:
+
+```solidity
+seniorRecovery =
+    min(recoveredAmount, seniorPrincipal);
+```
+
+Junior recovery receives the remainder:
+
+```solidity
+juniorRecovery =
+    recoveredAmount - seniorRecovery;
+```
+
+The following must hold:
+
+```solidity
+seniorRecovery + juniorRecovery
+    == recoveredAmount;
+```
+
+---
+
+## 11.2 Loss Allocation
+
+Senior loss is:
+
+```solidity
+seniorLoss =
+    seniorPrincipal - seniorRecovery;
+```
+
+Junior loss is:
+
+```solidity
+juniorLoss =
+    juniorPrincipal - juniorRecovery;
+```
+
+Total realized principal loss is:
+
+```solidity
+loss =
+    principal - recoveredAmount;
+```
+
+The following must hold:
+
+```solidity
+seniorLoss + juniorLoss == loss;
+```
+
+Because recovery is allocated to Senior first, Junior absorbs first-loss exposure.
+
+Senior suffers loss only after Junior principal for that position is fully impaired.
+
+---
+
+## 11.3 Bad Debt
+
+`totalBadDebt` is cumulative and non-decreasing.
+
+For each resolved default:
+
+```solidity
+badDebtDelta =
+    principal - finalizedRecoveryAmount;
+```
+
+Unpaid financing fee is excluded.
+
+---
+
+## 11.4 NAV Effects
+
+Recovered cash restores token backing for NAV that was already accounted.
+
+Recovery does not independently increase NAV.
+
+Losses reduce NAV through:
+
+```solidity
+writeDown(lossAmount)
+```
+
+Write-down order:
+
+1. Junior loss;
+2. Senior residual loss.
+
+LP shares are not burned. The NAV decrease is reflected through ERC-4626 share price.
+
+---
+
+# 12. ERC-4626 Tranche Accounting
+
+## 12.1 Accounted Assets
+
+Each tranche overrides `totalAssets()` to return internal `accountedAssets`.
+
+This represents:
+
+* free cash;
+* active receivable exposure;
+* realized fee income;
+* minus realized writedowns.
+
+---
+
+## 12.2 Locked Assets
+
+Funding increases locked assets without reducing NAV.
+
+```solidity
+lockedAssets += tranchePrincipal;
+```
+
+Settlement or default resolution unlocks the original stored tranche principal.
+
+```solidity
+lockedAssets -= tranchePrincipal;
+```
+
+---
+
+## 12.3 Available Liquidity
+
+```solidity
+availableLiquidity =
+    accountedAssets - lockedAssets;
+```
+
+This value limits:
+
+* new financing;
+* withdrawals;
+* redemptions.
+
+---
+
+## 12.4 Raw Cash Constraint
+
+Withdrawals are additionally limited by the actual ERC-20 balance held by the tranche.
+
+Therefore maximum withdrawal is bounded by:
+
+* LP ownership;
+* available accounting liquidity;
+* raw cash balance.
+
+---
+
+## 12.5 Funding
+
+`fundInvoice()` transfers cash to the Supplier but does not reduce `accountedAssets`.
+
+The vault replaces cash with receivable exposure.
+
+---
+
+## 12.6 Fee Credit
+
+`creditAssets()` is used only for incremental realized yield.
+
+Before NAV increases, the tranche verifies that the corresponding cash backing exists.
+
+Principal must not be credited twice.
+
+---
+
+## 12.7 Write-Down
+
+`writeDown()` decreases `accountedAssets` without burning LP shares.
+
+The corresponding locked position must first be unlocked.
+
+---
+
+## 12.8 Direct Token Transfers
+
+A direct ERC-20 transfer to SeniorPool or JuniorPool does not automatically increase accounted NAV.
+
+Only explicit protocol accounting functions modify `accountedAssets`.
+
+---
+
+# 13. Liquidity Architecture
 
 Invoice financing creates a structural liquidity mismatch.
 
-LP shares in this protocol are redeemable, but underlying assets may be locked inside
-active invoice financing positions until settlement, default resolution, or recovery
-completion.
+LP shares may represent valid NAV while the corresponding cash is deployed into illiquid invoice receivables.
 
-Unlike DeFi lending pools where collateral and debt positions may be continuously
-rebalanced or liquidated, invoice receivables are illiquid by design. They mature at
-fixed future dates and depend on off-chain Buyer repayment.
+This is an inherent property of the asset class.
 
-This means liquidity providers may not always be able to withdraw their full share
-value immediately, even if their ERC-4626 shares represent valid ownership of pool NAV.
+## Liquidity Constraints
 
-This is not a bug. It is the fundamental characteristic of invoice financing: capital
-is committed for the duration of the invoice tenor.
-
-## Available Liquidity
-
-The protocol distinguishes between total pool assets and assets locked in active
-financing positions.
+The following must hold:
 
 ```solidity
-availableLiquidity = totalPoolAssets - totalLockedAssets;
+seniorLockedAssets <= seniorTotalAssets;
+juniorLockedAssets <= juniorTotalAssets;
 ```
-
-Where:
-
-- `totalPoolAssets` represents total assets controlled by the pool accounting system
-- `totalLockedAssets` represents capital committed to active funded invoices
-- `availableLiquidity` represents the amount that may be used for new financing or withdrawals
-
-Withdrawals must be limited by available liquidity.
-
-A liquidity provider may only redeem assets that are not currently locked inside active
-invoice financing positions.
-
-## Senior and Junior Liquidity Buckets
-
-SeniorPool and JuniorPool are separate ERC-4626 vaults with separate liquidity, locked
-asset accounting, NAV, and share price.
-
-InvoiceFinancingPool coordinates financing across both pools according to a fixed
-capital allocation ratio.
 
 ```solidity
-seniorPrincipal = principal * seniorFundingShareBps / 10_000;
-juniorPrincipal = principal - seniorPrincipal;
+totalLockedAssets =
+    seniorLockedAssets + juniorLockedAssets;
 ```
-
-The following invariant must always hold:
 
 ```solidity
-seniorFundingShareBps + juniorFundingShareBps == 10_000;
+seniorAvailableLiquidity =
+    seniorTotalAssets - seniorLockedAssets;
 ```
-
-Each pool must have enough available liquidity before an invoice can be funded:
 
 ```solidity
-seniorAvailableLiquidity >= seniorPrincipal;
-juniorAvailableLiquidity >= juniorPrincipal;
+juniorAvailableLiquidity =
+    juniorTotalAssets - juniorLockedAssets;
 ```
 
-When an invoice is funded:
+Funding fails if either tranche cannot satisfy its required principal contribution.
 
-```solidity
-seniorLockedAssets += seniorPrincipal;
-juniorLockedAssets += juniorPrincipal;
-```
+Withdrawals fail if they would consume liquidity committed to unresolved positions.
 
-When an invoice is settled or defaulted:
+---
 
-```solidity
-seniorLockedAssets -= seniorPrincipal;
-juniorLockedAssets -= juniorPrincipal;
-```
+# 14. Atomicity and CEI Requirements
 
-The split recorded at funding time is used for all subsequent settlement, default, and
-locked asset release calculations. Changes to `seniorFundingShareBps` after funding do
-not affect active positions.
+Financing, settlement, and default resolution must be atomic.
 
-This architecture preserves separate ERC-4626 accounting while allowing the
-InvoiceFinancingPool to act as the coordinating SPV layer.
+The protocol uses checks-effects-interactions ordering:
 
-## Locked Assets
+* validate lifecycle and oracle conditions;
+* close local accounting;
+* perform external token and vault calls;
+* update dependent protocol components;
+* finalize InvoiceNFT lifecycle state.
 
-When an invoice transitions from VERIFIED to FUNDED, the financed principal becomes
-locked across the SeniorPool and JuniorPool according to the configured funding share.
+If any external call fails, the entire transaction reverts.
 
-When an invoice transitions from FUNDED to SETTLED or DEFAULTED, locked assets are
-released from the active financing bucket.
+This preserves consistency across:
 
-Locked assets prevent the protocol from treating deployed capital as freely withdrawable
-liquidity.
+* financing positions;
+* aggregate locked assets;
+* tranche locked assets;
+* tranche NAV;
+* Buyer exposure;
+* InvoiceNFT lifecycle;
+* token balances.
 
-## Withdrawal Constraints
+---
 
-LP withdrawals must respect the available liquidity constraint.
+# 15. Security and Trust Assumptions
 
-If pool liquidity is fully deployed into active invoices, withdrawal requests may need
-to wait until invoices settle, default, or recover.
+The protocol assumes:
 
-The v1 protocol enforces this by reverting withdrawals that exceed available liquidity.
+* Originators submit genuine invoice data.
+* Verifiers perform valid invoice review.
+* Risk administrators configure economically reasonable parameters.
+* Oracle Submitters report accurate off-chain outcomes.
+* Dispute administrators act independently and within the dispute window.
+* The underlying ERC-20 is non-rebasing and non-fee-on-transfer.
+* Off-chain legal and servicing processes reconcile recovery assets correctly.
+* Role-bearing accounts are secured.
 
-Future versions may introduce withdrawal queues, epoch-based redemptions, or liquidity
-reserve buffers.
+The protocol does not independently prove:
 
-## Oracle Timeout Limitation
+* invoice authenticity;
+* legal assignment;
+* Buyer acceptance;
+* absence of cross-protocol double financing;
+* bank payment;
+* recovered principal;
+* legal enforceability.
 
-The v1 protocol does not include an automatic timeout mechanism for unresolved funded
-invoices.
+These limitations are documented in `RISKS.md`.
 
-If OracleSubmitter never reports settlement, default, dispute, or operational
-resolution, a FUNDED invoice may remain active and locked until an authorized update
-is submitted.
+---
 
-This is a known v1 limitation and reinforces the importance of oracle availability,
-operational monitoring, and bounded emergency controls.
+# 16. Final Security Boundary
 
-Future versions may introduce time-based escalation paths, automated grace periods,
-or dispute-resolution workflows.
+The v1 protocol separates three core responsibilities.
 
-## Liquidity Invariants
+## Oracle
 
-- `totalLockedAssets` must never exceed `totalPoolAssets`.
-- `availableLiquidity` must never be negative.
-- SeniorPool and JuniorPool must track locked assets independently.
-- Funding an invoice must increase SeniorPool and JuniorPool locked assets according to the configured funding share.
-- Settling an invoice must decrease SeniorPool and JuniorPool locked assets according to the original financed split.
-- Defaulting an invoice must decrease SeniorPool and JuniorPool locked assets according to the original financed split.
-- Funding must fail if either tranche lacks sufficient available liquidity.
-- Senior and Junior funding shares must sum to 10,000 basis points.
-- LP withdrawals must not reduce pool liquidity below locked asset requirements.
-- Locked assets must not be withdrawn while invoices remain active.
-- Liquidity constraints must apply independently to SeniorPool and JuniorPool accounting.
+Attests:
+
+* terminal invoice outcome;
+* recovered principal for defaulted invoices.
+
+## Pool
+
+Validates and stores the finalized outcome, then executes:
+
+* principal restoration;
+* fee distribution;
+* recovery allocation;
+* tranche writedowns;
+* Buyer exposure reduction;
+* bad-debt recognition;
+* terminal lifecycle transition.
+
+## Executor
+
+Supplies required assets and triggers accounting.
+
+The executor cannot:
+
+* choose status;
+* choose recovery;
+* change financing terms;
+* override waterfalls;
+* resolve twice.
+
+This separation is the central accounting and authorization boundary of the protocol.
