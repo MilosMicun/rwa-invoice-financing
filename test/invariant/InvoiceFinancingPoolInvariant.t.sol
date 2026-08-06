@@ -30,8 +30,9 @@ import {InvoiceFinancingPoolHandler} from "./handlers/InvoiceFinancingPoolHandle
 /// - default resolution;
 /// - freeze and unfreeze.
 ///
-/// Global invariants then reconstruct protocol accounting from stored financing
-/// positions and compare it against aggregate accounting state.
+/// The catalogue combines independently ghost-reconstructed expectations,
+/// cross-storage consistency checks, direct protocol bounds, and lifecycle
+/// coherence properties.
 contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
     MockERC20 internal asset;
     InvoiceNFT internal invoiceNft;
@@ -49,6 +50,7 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
     address internal riskAdmin = makeAddr("riskAdmin");
     address internal supplier = makeAddr("supplier");
     address internal buyer = makeAddr("buyer");
+    address internal buyerTwo = makeAddr("buyerTwo");
     address internal resolver = makeAddr("resolver");
     address internal seniorLp = makeAddr("seniorLp");
     address internal juniorLp = makeAddr("juniorLp");
@@ -58,6 +60,7 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
     uint256 internal constant MAX_INVOICE_TENOR = 90 days;
     uint256 internal constant MIN_INVOICE_AMOUNT = 1_000e18;
     uint256 internal constant FINANCING_FEE_APR_BPS = 1_200;
+    uint256 internal constant BPS_DENOMINATOR = 10_000;
 
     uint256 internal constant SENIOR_FUNDING_SHARE_BPS = 7_000;
     uint256 internal constant JUNIOR_FUNDING_SHARE_BPS = 3_000;
@@ -119,11 +122,24 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
             verifier: verifier,
             riskAdmin: riskAdmin,
             supplier: supplier,
-            buyer: buyer,
+            buyerOne: buyer,
+            buyerTwo: buyerTwo,
             resolver: resolver
         });
 
-        handler = new InvoiceFinancingPoolHandler(pool, oracle, actors);
+        InvoiceFinancingPoolHandler.ModelConfig memory modelConfig = InvoiceFinancingPoolHandler.ModelConfig({
+            maxExposurePerBuyer: MAX_EXPOSURE_PER_BUYER,
+            advanceRateBps: ADVANCE_RATE_BPS,
+            seniorFundingShareBps: SENIOR_FUNDING_SHARE_BPS,
+            bpsDenominator: BPS_DENOMINATOR,
+            maxInvoiceTenor: MAX_INVOICE_TENOR,
+            minInvoiceAmount: MIN_INVOICE_AMOUNT,
+            financingFeeAprBps: FINANCING_FEE_APR_BPS,
+            disputeWindow: DISPUTE_WINDOW,
+            maxStaleness: MAX_STALENESS
+        });
+
+        handler = new InvoiceFinancingPoolHandler(pool, oracle, actors, modelConfig);
 
         _targetHandlerSelectors();
     }
@@ -133,7 +149,7 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         assertEq(pool.totalLockedAssets(), seniorPool.lockedAssets() + juniorPool.lockedAssets());
     }
 
-    /// @notice Aggregate pool lock must equal unresolved financed principal.
+    /// @notice Aggregate pool lock must equal independently reconstructed unresolved principal.
     function invariant_TotalLockedAssetsEqualsUnresolvedPrincipal() public view {
         uint256 expectedLockedAssets;
         uint256 invoiceCount = handler.financedInvoiceCount();
@@ -141,45 +157,61 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (,, uint256 principal,,,,,, bool resolved) = pool.financingPositions(invoiceId);
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
 
-            if (!resolved) {
-                expectedLockedAssets += principal;
+            assertTrue(ghost.exists);
+
+            if (!ghost.resolved) {
+                expectedLockedAssets += ghost.principal;
             }
         }
 
         assertEq(pool.totalLockedAssets(), expectedLockedAssets);
     }
 
-    /// @notice Buyer exposure must equal active principal for that Buyer.
+    /// @notice Each Buyer exposure key must equal independently reconstructed active principal.
     function invariant_BuyerExposureEqualsActivePrincipal() public view {
-        uint256 expectedBuyerExposure;
+        uint256 buyerCount = handler.buyerCount();
         uint256 invoiceCount = handler.financedInvoiceCount();
 
-        for (uint256 i; i < invoiceCount; i++) {
-            uint256 invoiceId = handler.financedInvoiceIdAt(i);
+        for (uint256 buyerIndex; buyerIndex < buyerCount; buyerIndex++) {
+            address selectedBuyer = handler.buyerAt(buyerIndex);
+            uint256 expectedBuyerExposure;
 
-            (, address positionBuyer, uint256 principal,,,,,, bool resolved) = pool.financingPositions(invoiceId);
+            for (uint256 i; i < invoiceCount; i++) {
+                uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            if (!resolved && positionBuyer == buyer) {
-                expectedBuyerExposure += principal;
+                InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
+
+                assertTrue(ghost.exists);
+
+                if (!ghost.resolved && ghost.buyer == selectedBuyer) {
+                    expectedBuyerExposure += ghost.principal;
+                }
             }
-        }
 
-        assertEq(riskManager.getBuyerExposure(buyer), expectedBuyerExposure);
+            assertEq(riskManager.getBuyerExposure(selectedBuyer), expectedBuyerExposure);
+        }
     }
 
-    /// @notice Every financing position must conserve principal across tranches.
+    /// @notice Every production principal split must match its independent ghost expectation.
     function invariant_PositionPrincipalSplitConservesPrincipal() public view {
         uint256 invoiceCount = handler.financedInvoiceCount();
 
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (,, uint256 principal, uint256 seniorPrincipal, uint256 juniorPrincipal,,,,) =
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
+
+            (,, uint256 positionPrincipal, uint256 positionSeniorPrincipal, uint256 positionJuniorPrincipal,,,,) =
                 pool.financingPositions(invoiceId);
 
-            assertEq(seniorPrincipal + juniorPrincipal, principal);
+            assertTrue(ghost.exists);
+            assertEq(ghost.seniorPrincipal + ghost.juniorPrincipal, ghost.principal);
+
+            assertEq(positionPrincipal, ghost.principal);
+            assertEq(positionSeniorPrincipal, ghost.seniorPrincipal);
+            assertEq(positionJuniorPrincipal, ghost.juniorPrincipal);
         }
     }
 
@@ -190,13 +222,13 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         assertLe(juniorPool.lockedAssets(), juniorPool.totalAssets());
     }
 
-    /// @notice Financing position resolution must match the InvoiceNFT lifecycle.
+    /// @notice Production resolution and InvoiceNFT lifecycle must match ghost resolution.
     /// @dev
-    /// An unresolved financed position must remain economically active as:
+    /// An unresolved ghost position remains economically active as:
     /// - FUNDED; or
     /// - FROZEN with previousStatus == FUNDED.
     ///
-    /// A resolved position must be terminal:
+    /// A resolved ghost position must match its finalized terminal outcome:
     /// - SETTLED; or
     /// - DEFAULTED.
     function invariant_PositionResolutionMatchesInvoiceLifecycle() public view {
@@ -205,15 +237,24 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (,,,,,,,, bool resolved) = pool.financingPositions(invoiceId);
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
+
+            (,,,,,,,, bool positionResolved) = pool.financingPositions(invoiceId);
 
             IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
 
-            if (resolved) {
-                bool isTerminal = invoice.status == IInvoiceNFT.InvoiceStatus.SETTLED
-                    || invoice.status == IInvoiceNFT.InvoiceStatus.DEFAULTED;
+            assertTrue(ghost.exists);
+            assertEq(positionResolved, ghost.resolved);
 
-                assertTrue(isTerminal);
+            if (ghost.resolved) {
+                assertTrue(ghost.finalized);
+
+                if (ghost.finalizedStatus == IInvoiceNFT.InvoiceStatus.SETTLED) {
+                    assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.SETTLED));
+                } else {
+                    assertEq(uint256(ghost.finalizedStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+                    assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+                }
             } else {
                 bool isActive = invoice.status == IInvoiceNFT.InvoiceStatus.FUNDED
                     || (invoice.status == IInvoiceNFT.InvoiceStatus.FROZEN
@@ -224,96 +265,108 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         }
     }
 
-    /// @notice Finalized oracle data must remain canonical across Oracle and Pool.
+    /// @notice Oracle and Pool finalized data must match the independent ghost outcome.
     /// @dev
-    /// Pool finalization and Oracle finalization must remain atomic and coherent.
-    ///
-    /// Canonical rules:
+    /// The pending and finalized ghost values originate from successful handler
+    /// submissions rather than either production record.
     /// - SETTLED recovery is exactly zero;
-    /// - DEFAULTED recovery never exceeds stored principal;
+    /// - DEFAULTED recovery never exceeds ghost principal;
     /// - unfinalized pool state remains the default CREATED enum value;
-    /// - Oracle and Pool finalized records must match exactly.
+    /// - Oracle and Pool finalized records must match the ghost exactly.
     function invariant_FinalizedOracleDataIsCanonical() public view {
         uint256 invoiceCount = handler.financedInvoiceCount();
 
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (,, uint256 principal,,,,,,) = pool.financingPositions(invoiceId);
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
 
             IInvoiceNFT.InvoiceStatus poolStatus = pool.finalizedOracleStatus(invoiceId);
-
             uint256 recoveredAmount = pool.finalizedRecoveryAmount(invoiceId);
-
             bool poolFinalized = pool.isOracleStatusFinalized(invoiceId);
-
             IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
 
-            if (poolStatus == IInvoiceNFT.InvoiceStatus.SETTLED) {
-                assertTrue(poolFinalized);
-                assertEq(recoveredAmount, 0);
-            } else if (poolStatus == IInvoiceNFT.InvoiceStatus.DEFAULTED) {
-                assertTrue(poolFinalized);
-                assertLe(recoveredAmount, principal);
+            assertTrue(ghost.exists);
+
+            if (ghost.pendingOutcomeExists) {
+                assertEq(update.invoiceId, invoiceId);
+                assertEq(uint256(update.newStatus), uint256(ghost.pendingStatus));
+                assertEq(update.recoveredAmount, ghost.pendingRecovery);
+                assertEq(update.submittedAt, ghost.pendingSubmittedAt);
+                assertFalse(update.disputed);
             } else {
-                assertEq(uint256(poolStatus), uint256(IInvoiceNFT.InvoiceStatus.CREATED));
-                assertFalse(poolFinalized);
-                assertEq(recoveredAmount, 0);
+                assertEq(update.submittedAt, 0);
             }
 
-            assertEq(update.finalized, poolFinalized);
+            if (ghost.finalized) {
+                assertTrue(poolFinalized);
+                assertEq(uint256(poolStatus), uint256(ghost.finalizedStatus));
+                assertEq(recoveredAmount, ghost.finalizedRecovery);
 
-            if (update.finalized) {
-                assertEq(uint256(update.newStatus), uint256(poolStatus));
-                assertEq(update.recoveredAmount, recoveredAmount);
+                assertTrue(update.finalized);
+                assertEq(uint256(update.newStatus), uint256(ghost.finalizedStatus));
+                assertEq(update.recoveredAmount, ghost.finalizedRecovery);
+
+                if (ghost.finalizedStatus == IInvoiceNFT.InvoiceStatus.SETTLED) {
+                    assertEq(ghost.finalizedRecovery, 0);
+                } else {
+                    assertEq(uint256(ghost.finalizedStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+                    assertLe(ghost.finalizedRecovery, ghost.principal);
+                }
+            } else {
+                assertFalse(poolFinalized);
+                assertEq(uint256(poolStatus), uint256(IInvoiceNFT.InvoiceStatus.CREATED));
+                assertEq(recoveredAmount, 0);
+                assertFalse(update.finalized);
             }
         }
     }
 
-    /// @notice Terminal InvoiceNFT lifecycle must match the finalized oracle outcome.
+    /// @notice Terminal InvoiceNFT lifecycle must match the ghost-finalized outcome.
     /// @dev
-    /// Settlement and default execution are mutually exclusive.
-    ///
-    /// A SETTLED invoice must have:
-    /// - resolved financing position;
-    /// - finalized SETTLED oracle outcome;
-    /// - zero recovered principal.
-    ///
-    /// A DEFAULTED invoice must have:
-    /// - resolved financing position;
-    /// - finalized DEFAULTED oracle outcome.
+    /// Finalized but unresolved positions remain FUNDED, or FROZEN from FUNDED,
+    /// until permissionless economic execution succeeds.
     function invariant_TerminalLifecycleMatchesOracleOutcome() public view {
         uint256 invoiceCount = handler.financedInvoiceCount();
 
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (,,,,,,,, bool resolved) = pool.financingPositions(invoiceId);
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
 
             IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
 
-            IInvoiceNFT.InvoiceStatus oracleStatus = pool.finalizedOracleStatus(invoiceId);
+            assertTrue(ghost.exists);
 
-            if (invoice.status == IInvoiceNFT.InvoiceStatus.SETTLED) {
-                assertTrue(resolved);
+            if (ghost.resolved) {
+                assertTrue(ghost.finalized);
 
-                assertEq(uint256(oracleStatus), uint256(IInvoiceNFT.InvoiceStatus.SETTLED));
+                if (ghost.finalizedStatus == IInvoiceNFT.InvoiceStatus.SETTLED) {
+                    assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.SETTLED));
+                    assertEq(ghost.finalizedRecovery, 0);
+                } else {
+                    assertEq(uint256(ghost.finalizedStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+                    assertEq(uint256(invoice.status), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+                }
+            } else {
+                assertTrue(
+                    invoice.status != IInvoiceNFT.InvoiceStatus.SETTLED
+                        && invoice.status != IInvoiceNFT.InvoiceStatus.DEFAULTED
+                );
 
-                assertEq(pool.finalizedRecoveryAmount(invoiceId), 0);
-            }
+                bool isActive = invoice.status == IInvoiceNFT.InvoiceStatus.FUNDED
+                    || (invoice.status == IInvoiceNFT.InvoiceStatus.FROZEN
+                        && invoice.previousStatus == IInvoiceNFT.InvoiceStatus.FUNDED);
 
-            if (invoice.status == IInvoiceNFT.InvoiceStatus.DEFAULTED) {
-                assertTrue(resolved);
-
-                assertEq(uint256(oracleStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+                assertTrue(isActive);
             }
         }
     }
 
-    /// @notice Cumulative bad debt must equal all realized resolved default losses.
+    /// @notice Cumulative bad debt must equal ghost-reconstructed resolved default losses.
     /// @dev
-    /// Expected bad debt is reconstructed from immutable financed principal and
-    /// oracle-finalized recovered principal.
+    /// Expected principal and recovery come exclusively from successful handler
+    /// actions recorded in GhostPosition.
     ///
     /// Unpaid financing fee is intentionally excluded because it was never
     /// recognized as deployed principal NAV.
@@ -324,26 +377,24 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (,, uint256 principal,,,,,, bool resolved) = pool.financingPositions(invoiceId);
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
 
-            IInvoiceNFT.InvoiceStatus oracleStatus = pool.finalizedOracleStatus(invoiceId);
+            assertTrue(ghost.exists);
 
-            if (resolved && oracleStatus == IInvoiceNFT.InvoiceStatus.DEFAULTED) {
-                uint256 recoveredAmount = pool.finalizedRecoveryAmount(invoiceId);
+            if (ghost.resolved && ghost.finalized && ghost.finalizedStatus == IInvoiceNFT.InvoiceStatus.DEFAULTED) {
+                assertLe(ghost.finalizedRecovery, ghost.principal);
 
-                assertLe(recoveredAmount, principal);
-
-                expectedBadDebt += principal - recoveredAmount;
+                expectedBadDebt += ghost.principal - ghost.finalizedRecovery;
             }
         }
 
         assertEq(pool.totalBadDebt(), expectedBadDebt);
     }
 
-    /// @notice Each tranche lock must equal the sum of its unresolved position allocations.
+    /// @notice Each tranche lock must equal independently reconstructed unresolved splits.
     /// @dev
-    /// This reconstructs Senior and Junior locks independently from immutable
-    /// financing-position principal splits.
+    /// Senior and Junior expectations come from handler GhostPosition data rather
+    /// than production financing-position storage.
     ///
     /// It catches:
     /// - incorrect tranche unlock amounts;
@@ -359,12 +410,13 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (,,, uint256 seniorPrincipal, uint256 juniorPrincipal,,,, bool resolved) =
-                pool.financingPositions(invoiceId);
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
 
-            if (!resolved) {
-                expectedSeniorLockedAssets += seniorPrincipal;
-                expectedJuniorLockedAssets += juniorPrincipal;
+            assertTrue(ghost.exists);
+
+            if (!ghost.resolved) {
+                expectedSeniorLockedAssets += ghost.seniorPrincipal;
+                expectedJuniorLockedAssets += ghost.juniorPrincipal;
             }
         }
 
@@ -373,26 +425,28 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         assertEq(juniorPool.lockedAssets(), expectedJuniorLockedAssets);
     }
 
-    /// @notice Tranche available liquidity must equal NAV minus locked assets.
+    /// @notice Each tranche's token cash must exactly back its available liquidity.
     /// @dev
-    /// Locked receivable exposure remains part of tranche NAV but cannot be used
-    /// for new funding or LP withdrawals.
-    function invariant_TrancheAvailableLiquidityIsAccountingConsistent() public view {
-        assertEq(seniorPool.availableLiquidity(), seniorPool.totalAssets() - seniorPool.lockedAssets());
+    /// Exact equality relies on the current handler excluding direct donations,
+    /// fee-on-transfer tokens, rebasing tokens, and untracked vault inflows or
+    /// outflows.
+    function invariant_TrancheCashBacksAvailableLiquidity() public view {
+        assertEq(asset.balanceOf(address(seniorPool)), seniorPool.availableLiquidity());
 
-        assertEq(juniorPool.availableLiquidity(), juniorPool.totalAssets() - juniorPool.lockedAssets());
+        assertEq(asset.balanceOf(address(juniorPool)), juniorPool.availableLiquidity());
     }
 
-    /// @notice Financing positions must remain canonical against InvoiceNFT data.
+    /// @notice Production position and InvoiceNFT terms must match their ghost expectations.
     /// @dev
-    /// Position terms are fixed when the invoice is financed and must remain
-    /// coherent with the lifecycle registry for the entire position lifetime.
+    /// Expected identity, principal allocation, timestamps, and resolution state
+    /// originate exclusively from successful handler actions.
     ///
     /// This invariant verifies:
     /// - Supplier identity;
     /// - Buyer identity;
-    /// - due date;
-    /// - funding timestamp;
+    /// - principal and tranche allocations;
+    /// - due date and funding timestamp;
+    /// - production resolution state;
     /// - NFT ownership;
     /// - non-zero financed principal;
     /// - valid funded-to-due-date ordering.
@@ -402,27 +456,59 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         for (uint256 i; i < invoiceCount; i++) {
             uint256 invoiceId = handler.financedInvoiceIdAt(i);
 
-            (
-                address positionSupplier,
-                address positionBuyer,
-                uint256 principal,,,,
-                uint256 fundedAt,
-                uint256 dueDate,
-            ) = pool.financingPositions(invoiceId);
+            InvoiceFinancingPoolHandler.GhostPosition memory ghost = handler.getGhostPosition(invoiceId);
+
+            assertTrue(ghost.exists);
+
+            _assertProductionPositionMatchesGhost(invoiceId, ghost);
 
             IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
 
-            assertEq(positionSupplier, invoice.supplier);
-            assertEq(positionBuyer, invoice.buyer);
-            assertEq(dueDate, invoice.dueDate);
-            assertEq(fundedAt, invoice.fundedAt);
+            assertEq(invoice.supplier, ghost.supplier);
+            assertEq(invoice.buyer, ghost.buyer);
+            assertEq(invoice.dueDate, ghost.dueDate);
+            assertEq(invoice.fundedAt, ghost.fundedAt);
 
-            assertEq(invoiceNft.ownerOf(invoiceId), positionSupplier);
+            assertEq(invoiceNft.ownerOf(invoiceId), ghost.supplier);
 
-            assertGt(principal, 0);
-            assertGt(fundedAt, 0);
-            assertGt(dueDate, fundedAt);
+            assertGt(ghost.principal, 0);
+            assertGt(ghost.seniorPrincipal, 0);
+            assertGt(ghost.juniorPrincipal, 0);
+            assertGt(ghost.fundedAt, 0);
+            assertGt(ghost.dueDate, ghost.fundedAt);
         }
+    }
+
+    function _assertProductionPositionMatchesGhost(
+        uint256 invoiceId,
+        InvoiceFinancingPoolHandler.GhostPosition memory ghost
+    ) internal view {
+        (
+            address positionSupplier,
+            address positionBuyer,
+            uint256 positionPrincipal,
+            uint256 positionSeniorPrincipal,
+            uint256 positionJuniorPrincipal,,
+            uint256 positionFundedAt,
+            uint256 positionDueDate,
+            bool positionResolved
+        ) = pool.financingPositions(invoiceId);
+
+        assertEq(positionSupplier, ghost.supplier);
+
+        assertEq(positionBuyer, ghost.buyer);
+
+        assertEq(positionPrincipal, ghost.principal);
+
+        assertEq(positionSeniorPrincipal, ghost.seniorPrincipal);
+
+        assertEq(positionJuniorPrincipal, ghost.juniorPrincipal);
+
+        assertEq(positionFundedAt, ghost.fundedAt);
+
+        assertEq(positionDueDate, ghost.dueDate);
+
+        assertEq(positionResolved, ghost.resolved);
     }
 
     function _depositInitialTrancheLiquidity() internal {
