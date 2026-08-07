@@ -696,11 +696,9 @@ The stateful invariant suite also completed with:
 
 `forge build`, `forge fmt --check`, and `git diff --check` also passed locally.
 
-GitHub Actions passed for the invariant implementation commit `d0bd8f2`.
-
-The configuration commit `9c08419` was fully verified locally. Its GitHub
-Actions execution was pending while GitHub Actions was experiencing a hosted
-runner service incident.
+GitHub Actions passed for commit `d040db0` on the current
+`audit/final-review` branch state. That state includes the invariant execution
+configuration introduced in commit `9c08419`.
 
 ---
 
