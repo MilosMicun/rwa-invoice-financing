@@ -2,6 +2,10 @@
 cache/
 out/
 
+# Per-agent isolated Foundry build/cache dirs used by the security audit workflow
+out-*/
+cache-*/
+
 # Ignores development broadcast logs
 !/broadcast
 /broadcast/*/31337/
@@ -9,3 +13,6 @@ out/
 
 # Dotenv file
 .env
+
+# Local Claude session memory (private analysis notes)
+CLAUDE.local.md
