@@ -215,11 +215,13 @@ contract InvoiceFinancingPoolInvariantTest is StdInvariant, Test {
         }
     }
 
-    /// @notice Locked tranche assets must never exceed tranche NAV.
-    function invariant_TrancheLocksNeverExceedTrancheNav() public view {
-        assertLe(seniorPool.lockedAssets(), seniorPool.totalAssets());
+    /// @notice Reserved loss stays within locks and net exposure stays within tranche NAV.
+    function invariant_TrancheNetExposureNeverExceedsTrancheNav() public view {
+        assertLe(seniorPool.pendingLoss(), seniorPool.lockedAssets());
+        assertLe(seniorPool.lockedAssets() - seniorPool.pendingLoss(), seniorPool.totalAssets());
 
-        assertLe(juniorPool.lockedAssets(), juniorPool.totalAssets());
+        assertLe(juniorPool.pendingLoss(), juniorPool.lockedAssets());
+        assertLe(juniorPool.lockedAssets() - juniorPool.pendingLoss(), juniorPool.totalAssets());
     }
 
     /// @notice Production resolution and InvoiceNFT lifecycle must match ghost resolution.

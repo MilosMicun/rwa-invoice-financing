@@ -32,6 +32,14 @@ import {SeniorPool} from "../pools/SeniorPool.sol";
 contract InvoiceFinancingPool is IInvoiceFinancingPool {
     using SafeERC20 for IERC20;
 
+    struct DefaultWaterfall {
+        uint256 seniorRecovery;
+        uint256 juniorRecovery;
+        uint256 seniorLoss;
+        uint256 juniorLoss;
+        uint256 totalLoss;
+    }
+
     error ZeroAssets();
     error InvalidFundingShares();
     error ZeroTranchePrincipal(uint256 invoiceId, uint256 seniorPrincipal, uint256 juniorPrincipal);
@@ -173,8 +181,9 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     /// Callable only by the configured InvoiceStatusOracle.
     ///
     /// This function records both the terminal status and the oracle-attested
-    /// recovered principal. It does not execute settlement/default accounting
-    /// and does not mutate InvoiceNFT.
+    /// recovered principal. A DEFAULTED outcome also atomically reserves its
+    /// canonical tranche losses against ERC-4626 NAV. It does not resolve the
+    /// financing position or mutate InvoiceNFT.
     ///
     /// A financing position must already exist. Oracle outcomes cannot be
     /// preloaded before an invoice becomes an active financed position.
@@ -211,16 +220,28 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             revert OracleStatusAlreadyFinalized(invoiceId);
         }
 
+        DefaultWaterfall memory waterfall;
+
         if (status == IInvoiceNFT.InvoiceStatus.SETTLED) {
             if (recoveredAmount != 0) {
                 revert InvalidRecoveryForStatus(status, recoveredAmount);
             }
         } else if (recoveredAmount > position.principal) {
             revert RecoveredAmountExceedsPrincipal(invoiceId, recoveredAmount, position.principal);
+        } else {
+            waterfall = _calculateDefaultWaterfall(position, recoveredAmount);
         }
 
         finalizedOracleStatus[invoiceId] = status;
         finalizedRecoveryAmount[invoiceId] = recoveredAmount;
+
+        if (waterfall.juniorLoss > 0) {
+            JUNIOR_POOL.reserveLoss(waterfall.juniorLoss);
+        }
+
+        if (waterfall.seniorLoss > 0) {
+            SENIOR_POOL.reserveLoss(waterfall.seniorLoss);
+        }
 
         emit OracleStatusFinalized(invoiceId, status, recoveredAmount);
     }
@@ -483,8 +504,9 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
     ///
     /// Accounting:
     /// - Recovered principal is allocated to SeniorPool first, then JuniorPool.
-    /// - JuniorPool absorbs first-loss exposure through NAV writedown.
-    /// - SeniorPool absorbs only residual loss after junior recovery is depleted.
+    /// - JuniorPool absorbs first-loss exposure through finalized NAV impairment.
+    /// - SeniorPool absorbs only residual loss after Junior first-loss capital is exhausted.
+    /// - Resolution realizes previously reserved tranche losses without applying a second NAV haircut.
     /// - `totalBadDebt` increases by realized principal credit loss.
     /// - Unpaid financing fee is not counted as bad debt because it was never realized NAV.
     /// - Locked assets and buyer exposure are reduced exactly once.
@@ -528,38 +550,31 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             revert RecoveredAmountExceedsPrincipal(invoiceId, recoveredAmount, position.principal);
         }
 
-        uint256 seniorRecovery = recoveredAmount > position.seniorPrincipal ? position.seniorPrincipal : recoveredAmount;
-
-        uint256 juniorRecovery = recoveredAmount - seniorRecovery;
-
-        uint256 seniorLoss = position.seniorPrincipal - seniorRecovery;
-        uint256 juniorLoss = position.juniorPrincipal - juniorRecovery;
-
-        uint256 loss = position.principal - recoveredAmount;
+        DefaultWaterfall memory waterfall = _calculateDefaultWaterfall(position, recoveredAmount);
 
         // Close local accounting before external calls.
         // If any later operation reverts, the whole transaction reverts atomically.
         position.resolved = true;
         totalLockedAssets -= position.principal;
-        totalBadDebt += loss;
+        totalBadDebt += waterfall.totalLoss;
 
-        if (seniorRecovery > 0) {
-            ASSET.safeTransferFrom(msg.sender, address(SENIOR_POOL), seniorRecovery);
+        if (waterfall.seniorRecovery > 0) {
+            ASSET.safeTransferFrom(msg.sender, address(SENIOR_POOL), waterfall.seniorRecovery);
         }
 
-        if (juniorRecovery > 0) {
-            ASSET.safeTransferFrom(msg.sender, address(JUNIOR_POOL), juniorRecovery);
+        if (waterfall.juniorRecovery > 0) {
+            ASSET.safeTransferFrom(msg.sender, address(JUNIOR_POOL), waterfall.juniorRecovery);
         }
 
         SENIOR_POOL.unlockAssets(position.seniorPrincipal);
         JUNIOR_POOL.unlockAssets(position.juniorPrincipal);
 
-        if (juniorLoss > 0) {
-            JUNIOR_POOL.writeDown(juniorLoss);
+        if (waterfall.juniorLoss > 0) {
+            JUNIOR_POOL.writeDown(waterfall.juniorLoss);
         }
 
-        if (seniorLoss > 0) {
-            SENIOR_POOL.writeDown(seniorLoss);
+        if (waterfall.seniorLoss > 0) {
+            SENIOR_POOL.writeDown(waterfall.seniorLoss);
         }
 
         RISK_MANAGER.updateBuyerExposure(position.buyer, position.principal, false);
@@ -572,11 +587,11 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
             position.buyer,
             position.principal,
             recoveredAmount,
-            seniorRecovery,
-            juniorRecovery,
-            loss,
-            juniorLoss,
-            seniorLoss
+            waterfall.seniorRecovery,
+            waterfall.juniorRecovery,
+            waterfall.totalLoss,
+            waterfall.juniorLoss,
+            waterfall.seniorLoss
         );
     }
 
@@ -727,9 +742,22 @@ contract InvoiceFinancingPool is IInvoiceFinancingPool {
         return SENIOR_POOL.totalAssets() + JUNIOR_POOL.totalAssets();
     }
 
+    /// @dev Calculates the canonical senior-first recovery and junior-first loss waterfall.
+    function _calculateDefaultWaterfall(FinancingPosition storage position, uint256 recoveredAmount)
+        internal
+        view
+        returns (DefaultWaterfall memory waterfall)
+    {
+        waterfall.seniorRecovery =
+            recoveredAmount > position.seniorPrincipal ? position.seniorPrincipal : recoveredAmount;
+        waterfall.juniorRecovery = recoveredAmount - waterfall.seniorRecovery;
+        waterfall.seniorLoss = position.seniorPrincipal - waterfall.seniorRecovery;
+        waterfall.juniorLoss = position.juniorPrincipal - waterfall.juniorRecovery;
+        waterfall.totalLoss = position.principal - recoveredAmount;
+    }
+
     /// @dev Returns true only for finalized oracle outcomes accepted by the pool.
     function _isAllowedFinalizedOracleStatus(IInvoiceNFT.InvoiceStatus status) internal pure returns (bool) {
         return status == IInvoiceNFT.InvoiceStatus.SETTLED || status == IInvoiceNFT.InvoiceStatus.DEFAULTED;
     }
 }
-

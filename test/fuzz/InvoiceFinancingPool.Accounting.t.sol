@@ -400,7 +400,9 @@ contract InvoiceFinancingPoolAccountingFuzzTest is Test {
         uint256 invoiceId,
         uint256 expectedPrincipal,
         uint256 expectedSeniorPrincipal,
-        uint256 expectedJuniorPrincipal
+        uint256 expectedJuniorPrincipal,
+        uint256 expectedSeniorLoss,
+        uint256 expectedJuniorLoss
     ) internal view {
         IInvoiceNFT.Invoice memory invoice = invoiceNft.getInvoice(invoiceId);
 
@@ -415,8 +417,11 @@ contract InvoiceFinancingPoolAccountingFuzzTest is Test {
 
         assertEq(riskManager.getBuyerExposure(buyer), expectedPrincipal);
 
-        assertEq(seniorPool.totalAssets(), SENIOR_DEPOSIT);
-        assertEq(juniorPool.totalAssets(), JUNIOR_DEPOSIT);
+        assertEq(seniorPool.pendingLoss(), expectedSeniorLoss);
+        assertEq(juniorPool.pendingLoss(), expectedJuniorLoss);
+
+        assertEq(seniorPool.totalAssets(), SENIOR_DEPOSIT - expectedSeniorLoss);
+        assertEq(juniorPool.totalAssets(), JUNIOR_DEPOSIT - expectedJuniorLoss);
 
         assertEq(asset.balanceOf(address(seniorPool)), SENIOR_DEPOSIT - expectedSeniorPrincipal);
         assertEq(asset.balanceOf(address(juniorPool)), JUNIOR_DEPOSIT - expectedJuniorPrincipal);
@@ -828,7 +833,7 @@ contract InvoiceFinancingPoolAccountingFuzzTest is Test {
         pool.resolveDefault(invoiceId);
         vm.stopPrank();
 
-        _assertActiveDefaultFailureState(invoiceId, principal, seniorPrincipal, juniorPrincipal);
+        _assertActiveDefaultFailureState(invoiceId, principal, seniorPrincipal, juniorPrincipal, seniorLoss, juniorLoss);
 
         asset.mint(buyer, recoveredAmount);
 

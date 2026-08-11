@@ -125,6 +125,7 @@ interface IInvoiceFinancingPool {
     /// Callable only by the configured oracle.
     /// The implementation must reject outcomes for invoices without an existing
     /// financing position and must validate recovery against the stored principal.
+    /// DEFAULTED finalization also atomically reserves canonical tranche losses in NAV.
     /// @param invoiceId Identifier of the financed invoice.
     /// @param status Finalized terminal outcome: SETTLED or DEFAULTED.
     /// @param recoveredAmount Oracle-attested recovered principal for a default.
@@ -199,4 +200,3 @@ interface IInvoiceFinancingPool {
             bool resolved
         );
 }
-

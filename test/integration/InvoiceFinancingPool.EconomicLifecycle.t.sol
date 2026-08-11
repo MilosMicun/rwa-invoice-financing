@@ -36,6 +36,8 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
     address internal attacker = makeAddr("attacker");
     address internal seniorLp = makeAddr("seniorLp");
     address internal juniorLp = makeAddr("juniorLp");
+    address internal juniorLpTwo = makeAddr("juniorLpTwo");
+    address internal lateJuniorLp = makeAddr("lateJuniorLp");
 
     uint256 internal constant BPS = 10_000;
     uint256 internal constant SENIOR_DEPOSIT = 700_000e18;
@@ -128,6 +130,15 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         vm.startPrank(juniorLp);
         asset.approve(address(pool), juniorAssets);
         pool.depositJunior(juniorAssets);
+        vm.stopPrank();
+    }
+
+    function _depositJuniorFor(address lp, uint256 assets) internal returns (uint256 shares) {
+        asset.mint(lp, assets);
+
+        vm.startPrank(lp);
+        asset.approve(address(pool), assets);
+        shares = pool.depositJunior(assets);
         vm.stopPrank();
     }
 
@@ -365,6 +376,8 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         assertEq(uint256(pool.finalizedOracleStatus(invoiceId)), uint256(IInvoiceNFT.InvoiceStatus.SETTLED));
 
         assertEq(pool.finalizedRecoveryAmount(invoiceId), 0);
+        assertEq(seniorPool.pendingLoss(), 0);
+        assertEq(juniorPool.pendingLoss(), 0);
 
         _settleAsBuyer(invoiceId, principal + financingFee);
 
@@ -518,6 +531,11 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
 
         assertEq(expectedTotalLoss, expectedSeniorLoss + expectedJuniorLoss);
 
+        assertEq(juniorPool.pendingLoss(), expectedJuniorLoss);
+        assertEq(seniorPool.pendingLoss(), expectedSeniorLoss);
+        assertEq(juniorPool.totalAssets(), JUNIOR_DEPOSIT - expectedJuniorLoss);
+        assertEq(seniorPool.totalAssets(), SENIOR_DEPOSIT - expectedSeniorLoss);
+
         _resolveDefaultAsResolver(invoiceId);
 
         _assertDefaultResolvedState(
@@ -552,6 +570,147 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _assertDefaultResolvedState(
             invoiceId, SENIOR_DEPOSIT - seniorPrincipal, JUNIOR_DEPOSIT - juniorPrincipal, principal
         );
+    }
+
+    function test_DefaultFinalization_HaircutsJuniorExitForTwoEqualLpsEvenAfterThirtyDays() public {
+        uint256 equalJuniorDeposit = JUNIOR_DEPOSIT / 2;
+
+        _depositTranches(SENIOR_DEPOSIT, equalJuniorDeposit);
+        _depositJuniorFor(juniorLpTwo, equalJuniorDeposit);
+
+        uint256 invoiceId = _createVerifiedInvoice(FACE_VALUE, block.timestamp + INVOICE_TENOR);
+        _financeAsSupplier(invoiceId);
+
+        uint256 principal = _expectedPrincipal();
+        uint256 seniorPrincipal = _expectedSeniorPrincipal(principal);
+        uint256 juniorPrincipal = _expectedJuniorPrincipal(principal, seniorPrincipal);
+
+        _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, seniorPrincipal);
+
+        uint256 juniorShares = juniorPool.balanceOf(juniorLp);
+        uint256 impairedExitValue = juniorPool.previewRedeem(juniorShares);
+        uint256 expectedLpLoss = juniorPrincipal / 2;
+
+        assertEq(juniorPool.pendingLoss(), juniorPrincipal);
+        assertLt(impairedExitValue, equalJuniorDeposit);
+        assertApproxEqAbs(impairedExitValue, equalJuniorDeposit - expectedLpLoss, 1);
+        assertApproxEqAbs(juniorPool.maxWithdraw(juniorLp), impairedExitValue, 1);
+
+        vm.warp(block.timestamp + 30 days);
+
+        assertEq(juniorPool.previewRedeem(juniorShares), impairedExitValue);
+
+        uint256 sharesToRedeem = juniorPool.maxRedeem(juniorLp);
+        uint256 assetsBefore = asset.balanceOf(juniorLp);
+
+        vm.prank(juniorLp);
+        uint256 redeemedAssets = juniorPool.redeem(sharesToRedeem, juniorLp, juniorLp);
+
+        assertApproxEqAbs(redeemedAssets, impairedExitValue, 1);
+        assertEq(asset.balanceOf(juniorLp) - assetsBefore, redeemedAssets);
+        assertEq(juniorPool.pendingLoss(), juniorPrincipal);
+        assertFalse(_getPositionResolved(invoiceId));
+    }
+
+    function test_ResolveDefault_RealizesReservedLossWithoutSecondNavHaircut() public {
+        _depositTranches(SENIOR_DEPOSIT, JUNIOR_DEPOSIT);
+
+        uint256 invoiceId = _createVerifiedInvoice(FACE_VALUE, block.timestamp + INVOICE_TENOR);
+        _financeAsSupplier(invoiceId);
+
+        uint256 principal = _expectedPrincipal();
+        uint256 seniorPrincipal = _expectedSeniorPrincipal(principal);
+        uint256 juniorPrincipal = _expectedJuniorPrincipal(principal, seniorPrincipal);
+        uint256 juniorRecovery = 4_000e18;
+        uint256 recoveredAmount = seniorPrincipal + juniorRecovery;
+        uint256 juniorLoss = juniorPrincipal - juniorRecovery;
+
+        _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, recoveredAmount);
+
+        uint256 seniorNavBefore = seniorPool.totalAssets();
+        uint256 juniorNavBefore = juniorPool.totalAssets();
+        uint256 juniorPendingBefore = juniorPool.pendingLoss();
+        uint256 juniorGrossAssetsBefore = juniorNavBefore + juniorPendingBefore;
+
+        _resolveDefaultAsResolver(invoiceId);
+
+        assertEq(seniorPool.pendingLoss(), 0);
+        assertEq(juniorPool.pendingLoss(), 0);
+        assertEq(seniorPool.totalAssets(), seniorNavBefore);
+        assertEq(juniorPool.totalAssets(), juniorNavBefore);
+        assertEq(juniorPool.totalAssets(), juniorGrossAssetsBefore - juniorLoss);
+        assertEq(pool.totalBadDebt(), juniorLoss);
+    }
+
+    function test_DepositAfterDefaultFinalization_UsesImpairedNavAndAvoidsSecondLoss() public {
+        _depositTranches(SENIOR_DEPOSIT, JUNIOR_DEPOSIT);
+
+        uint256 invoiceId = _createVerifiedInvoice(FACE_VALUE, block.timestamp + INVOICE_TENOR);
+        _financeAsSupplier(invoiceId);
+
+        uint256 principal = _expectedPrincipal();
+        uint256 seniorPrincipal = _expectedSeniorPrincipal(principal);
+        uint256 juniorPrincipal = _expectedJuniorPrincipal(principal, seniorPrincipal);
+
+        _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, seniorPrincipal);
+
+        uint256 depositAssets = 30_000e18;
+        uint256 expectedShares = juniorPool.previewDeposit(depositAssets);
+        uint256 impairedNav = JUNIOR_DEPOSIT - juniorPrincipal;
+
+        assertGt(expectedShares, depositAssets);
+        assertEq(juniorPool.totalAssets(), impairedNav);
+
+        uint256 mintedShares = _depositJuniorFor(lateJuniorLp, depositAssets);
+
+        assertEq(mintedShares, expectedShares);
+        assertEq(juniorPool.totalAssets(), impairedNav + depositAssets);
+
+        uint256 lateLpValueBeforeResolution = juniorPool.previewRedeem(mintedShares);
+        uint256 navBeforeResolution = juniorPool.totalAssets();
+
+        _resolveDefaultAsResolver(invoiceId);
+
+        assertEq(juniorPool.pendingLoss(), 0);
+        assertEq(juniorPool.totalAssets(), navBeforeResolution);
+        assertEq(juniorPool.previewRedeem(mintedShares), lateLpValueBeforeResolution);
+    }
+
+    function test_MultipleFinalizedDefaults_AggregateAndResolveIndependently() public {
+        _depositTranches(SENIOR_DEPOSIT, JUNIOR_DEPOSIT);
+
+        uint256 dueDate = block.timestamp + INVOICE_TENOR;
+        uint256 firstInvoiceId = _createVerifiedInvoice(FACE_VALUE, dueDate);
+        uint256 secondInvoiceId = _createVerifiedInvoice(FACE_VALUE, dueDate);
+
+        _financeAsSupplier(firstInvoiceId);
+        _financeAsSupplier(secondInvoiceId);
+
+        uint256 principal = _expectedPrincipal();
+        uint256 seniorPrincipal = _expectedSeniorPrincipal(principal);
+        uint256 juniorPrincipal = _expectedJuniorPrincipal(principal, seniorPrincipal);
+        uint256 firstJuniorLoss = juniorPrincipal;
+        uint256 secondJuniorRecovery = 4_000e18;
+        uint256 secondJuniorLoss = juniorPrincipal - secondJuniorRecovery;
+
+        _submitAndFinalizeOracleStatus(firstInvoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, seniorPrincipal);
+        _submitAndFinalizeOracleStatus(
+            secondInvoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, seniorPrincipal + secondJuniorRecovery
+        );
+
+        assertEq(juniorPool.pendingLoss(), firstJuniorLoss + secondJuniorLoss);
+        assertEq(seniorPool.pendingLoss(), 0);
+
+        _resolveDefaultAsResolver(firstInvoiceId);
+
+        assertEq(juniorPool.pendingLoss(), secondJuniorLoss);
+        assertFalse(_getPositionResolved(secondInvoiceId));
+
+        _resolveDefaultAsResolver(secondInvoiceId);
+
+        assertEq(juniorPool.pendingLoss(), 0);
+        assertEq(seniorPool.pendingLoss(), 0);
+        assertEq(pool.totalBadDebt(), firstJuniorLoss + secondJuniorLoss);
     }
 
     function test_ResolveDefault_CannotExecuteWithLessThanOracleFinalizedRecovery() public {
@@ -952,10 +1111,14 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
 
         uint256 recoveredAmount = seniorPrincipal;
 
-        _submitAndFinalizeOracleStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, recoveredAmount);
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, recoveredAmount);
 
         vm.prank(riskAdmin);
         invoiceNft.freezeInvoice(invoiceId);
+
+        vm.warp(block.timestamp + DISPUTE_WINDOW + 1);
+        oracle.finalize(invoiceId);
 
         asset.mint(resolver, recoveredAmount);
 
@@ -981,9 +1144,13 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
 
         assertEq(juniorPool.lockedAssets(), juniorPrincipal);
 
+        assertEq(seniorPool.pendingLoss(), 0);
+
+        assertEq(juniorPool.pendingLoss(), juniorPrincipal);
+
         assertEq(seniorPool.totalAssets(), SENIOR_DEPOSIT);
 
-        assertEq(juniorPool.totalAssets(), JUNIOR_DEPOSIT);
+        assertEq(juniorPool.totalAssets(), JUNIOR_DEPOSIT - juniorPrincipal);
 
         assertFalse(_getPositionResolved(invoiceId));
     }
@@ -1074,4 +1241,3 @@ contract InvoiceFinancingPoolEconomicLifecycleTest is Test {
         _assertDefaultResolvedState(invoiceId, SENIOR_DEPOSIT, JUNIOR_DEPOSIT - juniorPrincipal, juniorPrincipal);
     }
 }
-

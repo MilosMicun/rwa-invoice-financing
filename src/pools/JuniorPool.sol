@@ -13,11 +13,12 @@ import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.so
 /// This is required because invoice financing sends tokens out to suppliers,
 /// while the pool still owns an economic claim against the financed receivable.
 ///
-/// `accountedAssets` is the ERC-4626 NAV source.
-/// `lockedAssets` is the portion of NAV committed to active invoice financings.
+/// `accountedAssets` is gross accounting assets before reserved default losses.
+/// `lockedAssets` is the portion of gross assets committed to active invoice financings.
+/// `pendingLoss` is finalized impairment reserved against unresolved defaults.
 ///
-/// Losses are later recognized through `writeDown()`, which decreases NAV
-/// without burning LP shares. This causes ERC-4626 share price to fall naturally.
+/// ERC-4626 NAV is `accountedAssets - pendingLoss`. A later `writeDown()` realizes
+/// the reserved loss without applying a second share-price haircut or burning LP shares.
 ///
 /// JuniorPool is the first-loss tranche. The default waterfall is not implemented
 /// inside this vault; it is enforced by InvoiceFinancingPool during default resolution.
@@ -28,11 +29,14 @@ contract JuniorPool is ERC4626 {
     error ZeroAssets();
     error InsufficientAvailableLiquidity();
     error InsufficientAccountedAssets();
+    error PendingLossExceedsLockedAssets();
+    error InsufficientPendingLoss();
     error NotInvoiceFinancingPool();
 
     event AssetsLocked(uint256 assets);
     event AssetsUnlocked(uint256 assets);
     event AssetsCredited(uint256 assets);
+    event LossReserved(uint256 assets);
     event AssetsWrittenDown(uint256 assets);
     event InvoiceFunded(address indexed receiver, uint256 assets);
 
@@ -40,6 +44,7 @@ contract JuniorPool is ERC4626 {
 
     uint256 private accountedAssets;
     uint256 public lockedAssets;
+    uint256 public pendingLoss;
 
     constructor(IERC20 asset_, address invoiceFinancingPool_)
         ERC20("Junior Invoice Pool Share", "jINV")
@@ -63,10 +68,10 @@ contract JuniorPool is ERC4626 {
         }
     }
 
-    /// @notice Returns pool-accounted NAV used by ERC-4626 share pricing.
+    /// @notice Returns impairment-adjusted pool NAV used by ERC-4626 share pricing.
     /// @dev This intentionally does not equal raw token balance during active financing.
     function totalAssets() public view override returns (uint256) {
-        return accountedAssets;
+        return accountedAssets - pendingLoss;
     }
 
     /// @notice Returns liquidity not locked in active invoice financings.
@@ -180,7 +185,25 @@ contract JuniorPool is ERC4626 {
         emit AssetsCredited(assets);
     }
 
-    /// @notice Recognizes realized loss by reducing pool NAV without burning LP shares.
+    /// @notice Reserves finalized default impairment against ERC-4626 NAV.
+    /// @dev Reservation does not change gross assets, locks, or token balances.
+    function reserveLoss(uint256 assets) external onlyInvoiceFinancingPool {
+        if (assets == 0) {
+            revert ZeroAssets();
+        }
+
+        uint256 newPendingLoss = pendingLoss + assets;
+
+        if (newPendingLoss > lockedAssets) {
+            revert PendingLossExceedsLockedAssets();
+        }
+
+        pendingLoss = newPendingLoss;
+
+        emit LossReserved(assets);
+    }
+
+    /// @notice Realizes an already reserved loss without a second ERC-4626 NAV haircut.
     /// @dev
     /// InvoiceFinancingPool must release the relevant locked position before calling this function.
     /// This keeps locked liquidity accounting explicit and prevents silent accounting repair.
@@ -193,11 +216,16 @@ contract JuniorPool is ERC4626 {
             revert InsufficientAccountedAssets();
         }
 
+        if (assets > pendingLoss) {
+            revert InsufficientPendingLoss();
+        }
+
         if (assets > availableLiquidity()) {
             revert InsufficientAvailableLiquidity();
         }
 
         accountedAssets -= assets;
+        pendingLoss -= assets;
 
         emit AssetsWrittenDown(assets);
     }
