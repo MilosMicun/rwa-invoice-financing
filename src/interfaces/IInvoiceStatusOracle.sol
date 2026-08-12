@@ -18,6 +18,7 @@ interface IInvoiceStatusOracle {
     error InvalidMaxStaleness();
     error InvalidOracleStatus(IInvoiceNFT.InvoiceStatus status);
     error InvalidRecoveryForStatus(IInvoiceNFT.InvoiceStatus status, uint256 recoveredAmount);
+    error RecoveredAmountExceedsPrincipal(uint256 invoiceId, uint256 recoveredAmount, uint256 principal);
     error InvoiceNotFunded(uint256 invoiceId, IInvoiceNFT.InvoiceStatus currentStatus);
     error StatusUpdateAlreadyActive(uint256 invoiceId);
     error StatusUpdateDoesNotExist(uint256 invoiceId);

@@ -92,9 +92,9 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
     /// SETTLED outcomes must use a zero recovered amount because paid-path cash flow
     /// is supplied and validated separately during settleInvoice().
     ///
-    /// DEFAULTED outcomes may report zero or non-zero recovered principal. The pool
-    /// validates the reported amount against the stored financed principal during
-    /// finalization.
+    /// DEFAULTED outcomes may report zero or non-zero recovered principal. Before
+    /// persistence, recovery is checked against the pool's stored financed principal.
+    /// The pool independently revalidates that bound during finalization.
     ///
     /// Resubmission is allowed only when the previous update was disputed or stale.
     /// Active non-disputed updates cannot be overwritten, and finalized updates are immutable.
@@ -131,6 +131,14 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
 
         if (activeUpdate) {
             revert StatusUpdateAlreadyActive(invoiceId);
+        }
+
+        if (newStatus == IInvoiceNFT.InvoiceStatus.DEFAULTED) {
+            (,, uint256 principal,,,,,,) = POOL.financingPositions(invoiceId);
+
+            if (recoveredAmount > principal) {
+                revert RecoveredAmountExceedsPrincipal(invoiceId, recoveredAmount, principal);
+            }
         }
 
         statusUpdates[invoiceId] = StatusUpdate({
@@ -237,4 +245,3 @@ contract InvoiceStatusOracle is AccessControl, IInvoiceStatusOracle {
         return status == IInvoiceNFT.InvoiceStatus.SETTLED || status == IInvoiceNFT.InvoiceStatus.DEFAULTED;
     }
 }
-

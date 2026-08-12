@@ -13,7 +13,6 @@ import {SeniorPool} from "../../src/pools/SeniorPool.sol";
 import {JuniorPool} from "../../src/pools/JuniorPool.sol";
 
 import {IInvoiceNFT} from "../../src/interfaces/IInvoiceNFT.sol";
-import {IInvoiceFinancingPool} from "../../src/interfaces/IInvoiceFinancingPool.sol";
 import {IInvoiceStatusOracle} from "../../src/interfaces/IInvoiceStatusOracle.sol";
 import {IRWARiskManager} from "../../src/interfaces/IRWARiskManager.sol";
 
@@ -614,7 +613,7 @@ contract InvoiceFinancingPoolAccountingFuzzTest is Test {
         );
     }
 
-    function testFuzz_OracleFinalize_Reverts_WhenDefaultRecoveryExceedsPrincipal(
+    function testFuzz_OracleSubmitStatus_Reverts_WhenDefaultRecoveryExceedsPrincipal(
         uint256 faceValue,
         uint256 tenor,
         uint256 recoveryExcess
@@ -634,21 +633,20 @@ contract InvoiceFinancingPoolAccountingFuzzTest is Test {
         uint256 principal = _getPositionPrincipal(invoiceId);
         uint256 excessiveRecovery = principal + recoveryExcess;
 
-        vm.prank(admin);
-        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, excessiveRecovery);
-
-        vm.warp(block.timestamp + DISPUTE_WINDOW + 1);
-
         vm.expectRevert(
             abi.encodeWithSelector(
-                IInvoiceFinancingPool.RecoveredAmountExceedsPrincipal.selector, invoiceId, excessiveRecovery, principal
+                IInvoiceStatusOracle.RecoveredAmountExceedsPrincipal.selector, invoiceId, excessiveRecovery, principal
             )
         );
 
-        oracle.finalize(invoiceId);
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, excessiveRecovery);
 
         IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
 
+        assertEq(update.submittedAt, 0);
+        assertEq(update.recoveredAmount, 0);
+        assertFalse(update.disputed);
         assertFalse(update.finalized);
         assertFalse(pool.isOracleStatusFinalized(invoiceId));
         assertEq(uint256(pool.finalizedOracleStatus(invoiceId)), uint256(IInvoiceNFT.InvoiceStatus.CREATED));

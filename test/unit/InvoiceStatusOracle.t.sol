@@ -27,6 +27,7 @@ contract InvoiceStatusOracleTest is Test {
     address internal unauthorizedCaller = makeAddr("unauthorizedCaller");
 
     uint256 internal constant FACE_VALUE = 100_000e18;
+    uint256 internal constant FINANCED_PRINCIPAL = 80_000e18;
     uint256 internal constant DEFAULT_RECOVERY = 40_000e18;
     uint256 internal constant UPDATED_RECOVERY = 20_000e18;
     uint256 internal constant INVOICE_TENOR = 30 days;
@@ -67,6 +68,8 @@ contract InvoiceStatusOracleTest is Test {
 
         vm.prank(poolOperator);
         invoiceNft.markFunded(invoiceId);
+
+        mockPool.setFinancedPrincipal(invoiceId, FINANCED_PRINCIPAL);
     }
 
     function _submitStatus(uint256 invoiceId, IInvoiceNFT.InvoiceStatus status, uint256 recoveredAmount) internal {
@@ -259,6 +262,74 @@ contract InvoiceStatusOracleTest is Test {
         assertFalse(update.finalized);
     }
 
+    function test_SubmitStatus_Reverts_WhenDefaultRecoveryExceedsPrincipalAndLeavesNoActiveUpdate() public {
+        uint256 invoiceId = _createFundedInvoice();
+        uint256 recoveredAmount = FINANCED_PRINCIPAL + 1;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IInvoiceStatusOracle.RecoveredAmountExceedsPrincipal.selector,
+                invoiceId,
+                recoveredAmount,
+                FINANCED_PRINCIPAL
+            )
+        );
+
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, recoveredAmount);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        assertEq(update.invoiceId, 0);
+        assertEq(uint256(update.newStatus), uint256(IInvoiceNFT.InvoiceStatus.CREATED));
+        assertEq(update.recoveredAmount, 0);
+        assertEq(update.submittedAt, 0);
+        assertFalse(update.disputed);
+        assertFalse(update.finalized);
+    }
+
+    function test_SubmitStatus_AllowsImmediateValidDefaultAfterExcessRecoveryReverts() public {
+        uint256 invoiceId = _createFundedInvoice();
+        uint256 invalidRecovery = FINANCED_PRINCIPAL + 1;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IInvoiceStatusOracle.RecoveredAmountExceedsPrincipal.selector,
+                invoiceId,
+                invalidRecovery,
+                FINANCED_PRINCIPAL
+            )
+        );
+
+        vm.prank(admin);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, invalidRecovery);
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, DEFAULT_RECOVERY);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        assertEq(update.invoiceId, invoiceId);
+        assertEq(uint256(update.newStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+        assertEq(update.recoveredAmount, DEFAULT_RECOVERY);
+        assertEq(update.submittedAt, block.timestamp);
+        assertFalse(update.disputed);
+        assertFalse(update.finalized);
+    }
+
+    function test_SubmitStatus_AllowsDefaultRecoveryEqualToPrincipal() public {
+        uint256 invoiceId = _createFundedInvoice();
+
+        _submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, FINANCED_PRINCIPAL);
+
+        IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
+
+        assertEq(uint256(update.newStatus), uint256(IInvoiceNFT.InvoiceStatus.DEFAULTED));
+        assertEq(update.recoveredAmount, FINANCED_PRINCIPAL);
+        assertGt(update.submittedAt, 0);
+        assertFalse(update.disputed);
+        assertFalse(update.finalized);
+    }
+
     function test_SubmitStatus_AllowsZeroRecoveryForDefault() public {
         uint256 invoiceId = _createFundedInvoice();
 
@@ -280,7 +351,7 @@ contract InvoiceStatusOracleTest is Test {
         vm.expectRevert(abi.encodeWithSelector(IInvoiceStatusOracle.StatusUpdateAlreadyActive.selector, invoiceId));
 
         vm.prank(admin);
-        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, DEFAULT_RECOVERY);
+        oracle.submitStatus(invoiceId, IInvoiceNFT.InvoiceStatus.DEFAULTED, FINANCED_PRINCIPAL + 1);
 
         IInvoiceStatusOracle.StatusUpdate memory update = oracle.getStatusUpdate(invoiceId);
 
@@ -627,4 +698,3 @@ contract InvoiceStatusOracleTest is Test {
         oracle.disputeStatus(invoiceId);
     }
 }
-
