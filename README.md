@@ -2,9 +2,9 @@
 
 ## 1. Overview
 
-This repository implements a Solidity reference protocol for financing verified invoices through separate Senior and Junior `ERC-4626` liquidity tranches. Each invoice is represented by a non-transferable `ERC-721` claim with an explicit lifecycle. Only the recorded Supplier may request financing, and each request is subject to invoice eligibility, Buyer denylist checks, active-principal concentration limits, and available tranche liquidity. Off-chain settlement or default outcomes enter through a permissioned, disputable oracle with bounded finalization timing. Oracle finalization records the protocol's finalized attestation and does not itself economically resolve the position: permissionless execution subsequently supplies the required assets and triggers deterministic settlement, recovery, fee distribution, tranche loss allocation, Buyer-exposure reduction, and cumulative bad-debt accounting.
+This repository implements a Solidity reference protocol for financing verified invoices through separate Senior and Junior `ERC-4626` liquidity tranches. Each invoice is represented by a non-transferable `ERC-721` claim with an explicit lifecycle. Only the recorded Supplier may request financing, and each request is subject to invoice eligibility, Buyer denylist checks, active-principal concentration limits, and available tranche liquidity. Off-chain settlement or default outcomes enter through a permissioned, disputable oracle with bounded finalization timing. Finalization records the protocol's attestation without economically resolving the position; a finalized `DEFAULTED` outcome nevertheless reserves its canonical tranche impairment in NAV immediately. Permissionless execution later supplies the required assets and completes settlement or default accounting.
 
-> **Status:** This is a locally verified portfolio/reference implementation. It has not been externally audited or formally verified, is not publicly deployed, and is not represented as production-ready.
+> **Status:** This is a locally verified portfolio/reference implementation. An independent external security review has been completed and its findings dispositioned, but this is not a formal production audit or formal verification. The protocol is not publicly deployed and is not represented as production-ready.
 
 ## 2. Design Highlights
 
@@ -18,7 +18,7 @@ This repository implements a Solidity reference protocol for financing verified 
 
 - **Underwriting controls:** `RWARiskManager` applies minimum invoice size, maximum remaining tenor, Buyer denylisting, eligibility checks, advance-rate rules, and active-principal concentration limits.
 
-- **Separated attestation and execution:** `InvoiceStatusOracle` finalizes an outcome, while `InvoiceFinancingPool` performs the subsequent asset movements and accounting resolution.
+- **Separated attestation and execution:** `InvoiceStatusOracle` finalizes an outcome, while `InvoiceFinancingPool` reserves finalized default impairment and later performs asset movements and accounting resolution.
 
 - **Deterministic economic waterfalls:** paid settlement distributes principal and stored financing fees; default recovery is allocated Senior-first, producing a Junior-first loss waterfall.
 
@@ -41,8 +41,8 @@ flowchart LR
 
     Pool -->|read and update lifecycle| NFT
     Pool -->|eligibility and exposure| Risk["RWARiskManager"]
-    Pool -->|lock, unlock, credit, or write down| Senior
-    Pool -->|lock, unlock, credit, or write down| Junior
+    Pool -->|lock, unlock, credit, reserve loss, or write down| Senior
+    Pool -->|lock, unlock, credit, reserve loss, or write down| Junior
 
     Outcome["Off-chain Outcome"] -.->|external trust input| Oracle["InvoiceStatusOracle"]
     Submitter["Oracle Submitter"] -->|submit| Oracle
@@ -84,13 +84,13 @@ Financing changes the claim to `FUNDED` and stores the Supplier, Buyer, aggregat
 
 An authorized Risk Admin may freeze an invoice only from `VERIFIED` or `FUNDED`. The NFT then has current status `FROZEN` and retains its prior lifecycle status in `previousStatus`. Unfreezing restores that prior status.
 
-Freezing and unfreezing are accounting-neutral: they do not alter the financing position, Buyer exposure, tranche locks, or liquidity accounting. Oracle finalization may remain recorded while a funded invoice is frozen, but economic execution requires the current NFT status to be `FUNDED`. Execution becomes possible only after unfreezing restores that status.
+Freezing and unfreezing are accounting-neutral: they do not alter the financing position, Buyer exposure, tranche locks, or tranche accounting. An already submitted `DEFAULTED` outcome may still finalize while the invoice is frozen, reserving its loss in `pendingLoss` and impairing NAV. Economic resolution remains blocked until unfreezing restores `FUNDED`.
 
 ### Oracle Outcome and Resolution
 
-A finalized oracle outcome identifies either a settled result or a defaulted result with an associated recovery amount. Finalization records the protocol's finalized attestation; it does not transfer assets, unlock tranche principal, reduce Buyer exposure, or mark the financing position as resolved.
+A finalized oracle outcome identifies either a settled result or a defaulted result with an associated recovery amount. `SETTLED` finalization records the attestation without changing tranche NAV. `DEFAULTED` finalization also computes the canonical waterfall from the stored financing position and reserves Junior and, if applicable, Senior loss through `pendingLoss`, immediately impairing ERC-4626 NAV.
 
-A later permissionless call performs economic execution. It supplies the assets required by the relevant path, updates both tranches, reduces Buyer exposure, marks the financing position resolved, and advances the invoice to its terminal lifecycle state.
+Neither outcome finalization transfers assets, unlocks tranche principal, reduces Buyer exposure, increments bad debt, resolves the position, or marks the NFT terminal. A later permissionless call performs economic execution. Default resolution realizes the already-reserved loss without a second NAV haircut, releases locks, reduces Buyer exposure, records bad debt, and marks the terminal NFT state.
 
 See [`docs/STATE_MACHINE.md`](docs/STATE_MACHINE.md) for the complete lifecycle and timing model.
 
@@ -141,9 +141,11 @@ seniorFee = financingFee - juniorFee;
 
 Any supplied amount above principal plus the stored financing fee is transferred to the position Supplier. The validated fixture uses `40%` Senior and `60%` Junior fee participation. Those percentages are fixture values, while the calculation above reflects the implementation's actual rounding behavior.
 
+Each realized tranche fee is credited as a lump-sum NAV increase. Shareholders present when that credit occurs participate pro rata; v1 does not snapshot financing-time holders or weight fee entitlement by holding duration. An LP may therefore enter shortly before settlement and share in that fee. This accepted v1 limitation can dilute incumbent LP yield but does not violate accounting conservation.
+
 ### Default Waterfall
 
-Default execution supplies the oracle-finalized recovery amount. Recovery is allocated Senior-first. Consequently, unrecovered principal is recognized Junior-first, with Senior absorbing only the residual loss after the Junior position allocation is exhausted.
+At `DEFAULTED` finalization, the pool computes the waterfall below from the stored financing position and reserves each tranche loss in `pendingLoss`. Recovery is allocated Senior-first. Consequently, unrecovered principal is reserved Junior-first, with Senior absorbing only the residual loss after the Junior principal allocation for that financing is exhausted.
 
 ```solidity
 seniorRecovery = min(recovery, seniorPrincipal);
@@ -156,17 +158,20 @@ seniorLoss = seniorPrincipal - seniorRecovery;
 realizedPrincipalLoss = juniorLoss + seniorLoss;
 ```
 
-Each tranche unlocks the original principal allocation, recognizes received recovery, and writes down its realized loss. `totalBadDebt` increases by unrecovered principal only; unpaid financing fees are not treated as principal bad debt.
+During later resolution, each tranche unlocks the original principal allocation and receives its recovery. `writeDown()` then decreases `accountedAssets` and `pendingLoss` by the same reserved loss, so it realizes the impairment without applying a second NAV haircut. `totalBadDebt` increases by unrecovered principal only; unpaid financing fees are not treated as principal bad debt.
 
 ### Tranche Accounting
 
 Each pool maintains internal accounting distinct from its raw token balance:
 
 ```text
+totalAssets = accountedAssets - pendingLoss
 availableLiquidity = accountedAssets - lockedAssets
 ```
 
-Financing transfers principal to the Supplier while increasing `lockedAssets`. Resolution unlocks that principal and records settlement proceeds, fee income, recovery, or write-downs as appropriate.
+`accountedAssets` is gross accounting assets before reserved default impairment, `lockedAssets` is gross tranche principal committed to unresolved financings, and `pendingLoss` is finalized but unresolved economic impairment. `pendingLoss` is not subtracted again from `availableLiquidity`.
+
+Financing transfers principal to the Supplier while increasing `lockedAssets`. `DEFAULTED` finalization increases `pendingLoss` without changing gross assets, locks, exposure, bad debt, or raw cash. Resolution unlocks principal and records settlement proceeds, fee income, recovery, or loss realization as appropriate.
 
 Direct token transfers to a tranche do not increase `accountedAssets`. Raw token balances and accounting values can therefore diverge when assets are donated or otherwise transferred outside supported pool entry points.
 
@@ -211,6 +216,8 @@ At the exact dispute-window boundary, both dispute and finalization are timing-v
 
 The protocol trusts authorized oracle actors and their operational controls to submit accurate off-chain outcomes. Timing rules and disputes constrain that trust but do not independently prove real-world payment or default.
 
+For `DEFAULTED`, `submitStatus()` rejects a recovered amount above the principal stored in `InvoiceFinancingPool.financingPositions(invoiceId)` before persisting the update. The pool independently revalidates the same bound when consuming the callback, providing defense in depth. The bound is not based on face value or current Risk Manager parameters.
+
 ### Roles and Administrative Authority
 
 Administrative roles originate and verify invoices, configure underwriting, manage oracle permissions, and control the freeze overlay. These roles are security boundaries rather than decentralization guarantees. A deployment would require explicit governance, key-management, monitoring, and incident-response procedures.
@@ -232,6 +239,7 @@ The test suite checks properties across lifecycle, authorization, economic, and 
 - tranche locks equal unresolved Senior and Junior allocations;
 - resolved positions cannot be economically executed twice;
 - cumulative bad debt equals realized default principal losses;
+- each tranche keeps `pendingLoss <= lockedAssets` and net unresolved exposure `lockedAssets - pendingLoss <= totalAssets()`;
 - funded position terms remain consistent with independently reconstructed ghost values;
 - frozen funded positions preserve accounting and block execution;
 - tranche cash balances match available-liquidity accounting within the generated state space.
@@ -251,16 +259,16 @@ The repository uses complementary test layers rather than relying on a single ve
 | Fuzz tests | Explore bounded input ranges for calculations, accounting, and state transitions. |
 | Stateful invariants | Execute long action sequences and compare production state with an independently maintained ghost model. |
 
-The current suite contains:
+The current validated suite contains:
 
-- `210` regular unit, integration, and fuzz tests;
+- `217` regular unit, integration, and fuzz tests;
 - `12` stateful invariant tests;
-- `222` total tests across all four layers.
+- `229` total tests across all four layers.
 
 Latest local full-suite verification:
 
 ```text
-222 passed
+229 passed
 0 failed
 0 skipped
 ```
@@ -395,7 +403,7 @@ The README provides orientation; these documents contain the detailed protocol b
 
 ## 12. Deployment and Development Status
 
-The core contracts, interfaces, test suites, and protocol documentation are implemented. The latest recorded local full-suite verification reports `222` tests passed, `0` failed, and `0` skipped across the unit, integration, fuzz, and invariant layers.
+The core contracts, interfaces, test suites, and protocol documentation are implemented. The latest recorded local full-suite verification reports `229` tests passed, `0` failed, and `0` skipped across the unit, integration, fuzz, and invariant layers.
 
 The next planned phase includes:
 
@@ -414,13 +422,13 @@ This repository is an educational and portfolio-oriented reference implementatio
 
 Important limitations include:
 
-- no completed external security audit;
-- no formal verification;
+- an independent external security review is complete, but no formal production audit or formal verification has been performed;
 - no public testnet or mainnet deployment;
 - no decentralized or cryptographically verified source of invoice outcomes;
 - no claim that every valid deployment configuration has been tested;
 - no established support for fee-on-transfer, rebasing, callback-enabled, or other non-standard ERC-20 assets;
 - no guarantee that Senior liquidity is loss-free;
+- no duration-weighted fee entitlement; LPs entering shortly before settlement may participate pro rata in the realized fee credited at settlement;
 - no on-chain legal enforcement of invoice obligations;
 - no integrated identity, KYC, AML, sanctions, document-authenticity, custody, or fiat-payment system;
 - no completed deployment governance, monitoring, emergency-response, or key-management framework.

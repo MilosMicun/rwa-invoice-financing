@@ -60,7 +60,40 @@ A non-exploitable observation involving:
 
 ---
 
-# 2. Resolved Security Findings
+# 2. Security Findings and External Review Dispositions
+
+## Independent External Review Dispositions
+
+An independent external security review has been completed. This disposition record does not represent a formal production audit or formal verification.
+
+| Finding | Severity | Disposition | Reference |
+|---|---|---|---|
+| V06-01 — stale NAV / default-loss timing | High | Resolved | `01d6a64` |
+| Oracle recovery-bound liveness | Medium | Resolved | `0b3e69f` |
+| V06-02 — just-in-time settlement-fee participation | Medium | Accepted v1 economic limitation | No production code remediation |
+| Fee-on-transfer / non-standard settlement asset incompatibility | Low / Informational | Accepted v1 asset assumption | See R-15 |
+| Funded-invoice freeze liveness | External Low; internal Medium | Accepted operational tradeoff | See R-05 |
+| Privileged-role / centralization residuals | Informational / centralization | Acknowledged trust model | See R-03 and R-01 |
+
+### V06-01 — Stale NAV / Default-Loss Timing
+
+**Root cause:** A finalized default could remain unresolved while its loss was absent from ERC-4626 share pricing, allowing LP entry or exit against stale NAV.
+
+**Remediation:** Commit `01d6a64` introduced `pendingLoss`. `DEFAULTED` finalization computes the canonical waterfall from the stored financing position and reserves Junior and, if applicable, Senior impairment atomically. `totalAssets()` returns `accountedAssets - pendingLoss`. Resolution later decreases both `accountedAssets` and `pendingLoss` by the realized loss, avoiding a second NAV haircut.
+
+**Security property:** Finalized default impairment affects share pricing before LP entry or exit can use stale NAV, while `pendingLoss <= lockedAssets` and `lockedAssets - pendingLoss <= totalAssets()` remain true for each tranche.
+
+**Regression evidence:** Dedicated integration and fuzz coverage checks immediate finalized-default NAV impairment, unchanged locks and exposure before resolution, failed underfunded resolution, cumulative reservations, and loss realization without a second haircut.
+
+### Oracle Recovery-Bound Liveness
+
+Commit `0b3e69f` resolves the Medium finding. For `DEFAULTED`, `InvoiceStatusOracle.submitStatus()` rejects `recoveredAmount` above the principal stored in `POOL.financingPositions(invoiceId)` before persisting an active update. The source is financed principal, not face value or a recomputed advance. `InvoiceFinancingPool.onStatusFinalized()` independently revalidates the same bound as defense in depth.
+
+### V06-02 — Just-in-Time Settlement-Fee Participation
+
+The finding is valid and remains an accepted v1 economic limitation. A realized settlement fee is credited as a lump-sum NAV increase and distributed pro rata through share ownership at credit time. v1 does not snapshot financing-time shareholders or weight entitlement by holding duration, so an LP may enter shortly before settlement and participate in the fee.
+
+This does not break accounting conservation, but it can dilute the yield of longer-standing LPs. No production code remediation is adopted by design in v1; preventing this behavior correctly would require materially different economics such as accrual, snapshots, duration weighting, or lockups.
 
 ## H-01 — Caller-Controlled Default Recovery Amount
 
@@ -173,6 +206,8 @@ The test verifies that:
 * locked assets remain unchanged;
 * buyer exposure remains unchanged;
 * `totalBadDebt` remains unchanged;
+* finalized `pendingLoss` and its NAV impairment remain reserved;
+* raw tranche cash remains unchanged by the reverted resolution;
 * resolution succeeds only when the full oracle-finalized recovery is supplied;
 * realized bad debt equals principal minus finalized recovered principal.
 
@@ -219,6 +254,7 @@ The authorized oracle may submit a false terminal outcome or an incorrect recove
 * maximum staleness limit;
 * permissionless finalization only after timing checks;
 * immutable finalized outcomes;
+* oracle-side rejection of `DEFAULTED` recovery above stored financed principal before persistence;
 * pool-side validation of recovery against stored principal;
 * oracle cannot directly execute tranche accounting;
 * oracle cannot directly mutate InvoiceNFT lifecycle state.
@@ -271,6 +307,8 @@ A production version may require:
 
 **Severity:** High
 **Status:** Accepted trust assumption
+
+The external review classified privileged-role and centralization residuals as Informational. They are acknowledged features of the v1 trust model, not remediated decentralization guarantees.
 
 Administrative authority controls or participates in:
 
@@ -338,7 +376,7 @@ Smart contracts enforce limits, not underwriting quality.
 
 ## R-05 — Funded Invoice Freeze Can Delay Resolution
 
-**Severity:** Medium
+**Severity:** Medium internally; Low in the external review
 **Status:** Accepted operational tradeoff
 
 An authorized risk role may freeze a funded invoice.
@@ -349,7 +387,9 @@ While frozen:
 * default execution is blocked;
 * locked assets remain locked;
 * buyer exposure remains active;
-* finalized oracle outcomes may exist but cannot be consumed.
+* finalized oracle outcomes may exist but cannot be economically resolved.
+
+Freeze and unfreeze themselves are accounting-neutral. If a `DEFAULTED` update was submitted before the freeze, it may still finalize while frozen. That finalization reserves the canonical loss in `pendingLoss` and immediately impairs tranche NAV even though resolution remains blocked until unfreeze.
 
 This prevents disputed or legally uncertain invoices from progressing through accounting, but it can also delay LP liquidity.
 
@@ -357,7 +397,7 @@ This prevents disputed or legally uncertain invoices from progressing through ac
 
 * only `VERIFIED` and `FUNDED` invoices may be frozen;
 * previous financial state is preserved;
-* freeze and unfreeze do not change principal, NAV, fee, or exposure accounting;
+* freeze and unfreeze themselves do not change principal, NAV, fee, or exposure accounting;
 * unfreeze restores the preserved lifecycle state;
 * terminal invoices cannot be frozen.
 
@@ -382,8 +422,9 @@ ERC-4626 shares may represent valid NAV while the corresponding assets remain lo
 
 ### Existing Mitigations
 
-* separate `accountedAssets` and `lockedAssets`;
-* `availableLiquidity = totalAssets - lockedAssets`;
+* separate `accountedAssets`, `lockedAssets`, and `pendingLoss`;
+* `totalAssets = accountedAssets - pendingLoss`;
+* `availableLiquidity = accountedAssets - lockedAssets` without subtracting `pendingLoss` again;
 * withdrawals are bounded by both available liquidity and actual token balance;
 * SeniorPool and JuniorPool enforce liquidity independently;
 * funding reverts if either tranche lacks sufficient liquidity.
@@ -437,7 +478,11 @@ A production deployment may additionally use:
 **Severity:** Informational
 **Status:** Intentional design behavior
 
-SeniorPool and JuniorPool use internal `accountedAssets` as the ERC-4626 NAV source.
+SeniorPool and JuniorPool use internal accounting rather than raw token balances as the ERC-4626 NAV source:
+
+```text
+totalAssets = accountedAssets - pendingLoss
+```
 
 Directly transferring underlying tokens to a tranche vault does not automatically increase `totalAssets()`.
 
@@ -448,7 +493,8 @@ This prevents raw token balance from becoming the accounting source of truth but
 * authorized `creditAssets()` is used for realized yield;
 * crediting NAV requires sufficient token backing;
 * financing does not reduce NAV merely because cash leaves the vault;
-* losses are recognized explicitly through `writeDown()`.
+* finalized default losses are reserved through `reserveLoss()`;
+* `writeDown()` later realizes an already reserved loss without a second NAV haircut.
 
 ### Residual Risk
 
@@ -470,8 +516,8 @@ If realized loss exceeds junior exposure for a financing position, SeniorPool ab
 ### Existing Mitigations
 
 * recovery is allocated to SeniorPool first;
-* JuniorPool absorbs losses first;
-* SeniorPool loss is recognized only after junior loss allocation;
+* the Junior principal allocation for the financing absorbs loss first;
+* Senior impairment is reserved only for loss exceeding that Junior principal allocation;
 * funding split is stored per position;
 * default allocation is deterministic.
 
@@ -607,7 +653,7 @@ This separates economic truth from execution authority, but a random keeper has 
 
 * the caller cannot reduce the recovery amount;
 * insufficient token balance or allowance causes the whole transaction to revert;
-* accounting remains unchanged after failed execution.
+* a failed resolution makes no further accounting change: any finalized `pendingLoss` and NAV impairment remain reserved, while locks, exposure, position resolution, bad debt, and raw tranche cash remain unchanged by the reverted call.
 
 ### Production Considerations
 
@@ -625,7 +671,9 @@ After funds are escrowed, any keeper could execute accounting without financing 
 ## R-15 — Underlying Asset Assumptions
 
 **Severity:** Medium
-**Status:** Accepted v1 assumption
+**Status:** Accepted v1 asset assumption
+
+The independent external review classified the fee-on-transfer / non-standard settlement-asset incompatibility as Low / Informational. The internal register retains Medium severity because asset selection is a deployment-wide accounting assumption.
 
 The protocol assumes a standard ERC-20 asset.
 
@@ -663,23 +711,26 @@ The current suite includes:
 * oracle-attested recovery propagation;
 * funding and tranche liquidity accounting;
 * paid-path fee distribution;
+* pending-loss reservation at `DEFAULTED` finalization;
+* realization of reserved losses without a second NAV haircut;
 * junior first-loss behavior;
 * senior residual loss;
 * zero recovery;
 * cumulative bad debt;
 * multiple active-position isolation;
-* H-01 security regression coverage.
+* H-01 security regression coverage;
+* oracle pre-persistence recovery-bound rejection and pool-side defense in depth.
 
-At configuration commit `9c08419`, the repository contains:
+The current validated repository state contains:
 
-- 210 regular unit, integration, and fuzz test functions;
+- 217 regular unit, integration, and fuzz test functions;
 - 12 stateful invariant functions;
-- 222 total checks.
+- 229 total checks.
 
-Local runtime verification completed with:
+Local full-suite verification completed with:
 
 ```text
-222 passed
+229 passed
 0 failed
 0 skipped
 ```
@@ -740,12 +791,12 @@ Attests off-chain economic truth:
 
 ## Pool
 
-Validates and stores finalized outcomes, then executes:
+Validates and stores finalized outcomes, reserves finalized default impairment, then executes:
 
 * principal restoration;
 * fee distribution;
 * recovery allocation;
-* tranche writedowns;
+* tranche loss realization;
 * buyer exposure reduction;
 * bad-debt recognition.
 

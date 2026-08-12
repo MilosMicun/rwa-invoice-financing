@@ -52,8 +52,8 @@ flowchart TD
 
     POOL -->|markSettled / markDefaulted| NFT
     POOL -->|exposure update| RM
-    POOL -->|unlock / credit / writeDown| SP
-    POOL -->|unlock / credit / writeDown| JP
+    POOL -->|unlock / credit / reserveLoss / writeDown| SP
+    POOL -->|unlock / credit / reserveLoss / writeDown| JP
 ```
 
 ---
@@ -170,8 +170,11 @@ SeniorPool and JuniorPool independently store:
 
 * `accountedAssets`;
 * `lockedAssets`;
+* `pendingLoss`;
 * ERC-4626 share supply and balances;
 * raw underlying token balance.
+
+`accountedAssets` is gross accounting assets before reserved default impairment. ERC-4626 NAV is `accountedAssets - pendingLoss`, while available liquidity is `accountedAssets - lockedAssets`.
 
 The coordinator must not calculate tranche NAV using its own aggregate storage.
 
@@ -186,9 +189,7 @@ The oracle reports:
 * the terminal off-chain status;
 * recovered principal for defaulted invoices.
 
-A finalized oracle outcome does not directly change InvoiceNFT state and does not execute accounting.
-
-It becomes an immutable input that the pool later consumes.
+A finalized oracle outcome does not directly change InvoiceNFT state or economically resolve a position. `SETTLED` finalization only records the immutable input. `DEFAULTED` finalization also causes the pool callback to reserve the canonical tranche impairment in `pendingLoss`, immediately affecting NAV before later resolution.
 
 ---
 
@@ -250,7 +251,7 @@ Unfreeze restores that previous status without changing:
 * locked assets;
 * finalized oracle outcome.
 
-A frozen funded invoice may already have a finalized oracle outcome, but accounting execution remains blocked until unfreeze.
+A frozen funded invoice may already have a finalized oracle outcome. Freeze and unfreeze themselves are accounting-neutral, but a previously submitted `DEFAULTED` outcome may finalize while frozen and reserve impairment in `pendingLoss`. Economic resolution remains blocked until unfreeze.
 
 ---
 
@@ -316,6 +317,7 @@ The pool is responsible for:
 * locking tranche capital;
 * advancing capital to Suppliers;
 * recording finalized oracle outcomes;
+* reserving finalized default impairment;
 * executing paid and default waterfalls;
 * reducing Buyer exposure;
 * resolving InvoiceNFT lifecycle state.
@@ -384,6 +386,7 @@ Each tranche has its own:
 
 * LP shares;
 * NAV;
+* pending loss;
 * locked assets;
 * available liquidity;
 * raw token balance;
@@ -429,6 +432,8 @@ Junior may receive a larger relative fee share because it absorbs first-loss exp
 
 Funding shares and fee shares represent different economic decisions.
 
+At settlement, each tranche's realized fee is credited through `creditAssets()` as an instantaneous NAV increase. ERC-4626 shareholders present at credit time participate pro rata. v1 has no financing-time shareholder snapshot or duration-weighted reward subsystem, so just-in-time fee participation remains an accepted economic limitation.
+
 ---
 
 # 9. NAV, Cash, and Locked Exposure
@@ -441,10 +446,12 @@ The tranche still owns economic exposure to the receivable.
 
 Reducing NAV merely because tokens left the vault would incorrectly recognize a loss at the moment of financing.
 
-Therefore:
+Therefore gross accounting and impairment-adjusted NAV are distinct:
 
 ```text
-accounted NAV = free cash + active receivable exposure + realized yield - realized loss
+gross accounting assets = accountedAssets
+finalized unresolved impairment = pendingLoss
+ERC-4626 NAV = accountedAssets - pendingLoss
 ```
 
 Raw token balance represents only immediately held cash.
@@ -453,14 +460,22 @@ Raw token balance represents only immediately held cash.
 
 ## 9.2 Accounted Assets
 
-Each tranche overrides ERC-4626 `totalAssets()` to return internal `accountedAssets`.
+Each tranche overrides ERC-4626 `totalAssets()` to return:
+
+```solidity
+accountedAssets - pendingLoss
+```
+
+`accountedAssets` is gross accounting assets before reserved default impairment.
 
 `accountedAssets` changes when:
 
 * an LP deposits;
 * an LP withdraws;
 * realized fee income is credited;
-* realized loss is written down.
+* an already reserved loss is realized through `writeDown()`.
+
+`pendingLoss` changes when finalized default impairment is reserved and when that same impairment is later realized.
 
 Funding and unlocking do not independently change NAV.
 
@@ -468,7 +483,7 @@ Funding and unlocking do not independently change NAV.
 
 ## 9.3 Locked Assets
 
-`lockedAssets` represents the portion of NAV committed to unresolved financing positions.
+`lockedAssets` represents gross tranche principal committed to unresolved financing positions.
 
 ```solidity
 availableLiquidity =
@@ -478,6 +493,13 @@ availableLiquidity =
 Funding increases locked assets.
 
 Settlement or default resolution decreases locked assets using the original stored principal split.
+
+`pendingLoss` is not subtracted again from available liquidity. The relevant safety relationships are:
+
+```text
+pendingLoss <= lockedAssets
+lockedAssets - pendingLoss <= totalAssets()
+```
 
 ---
 
@@ -505,13 +527,11 @@ Crediting principal again would double-count tranche NAV.
 
 ---
 
-## 9.6 Loss Recognition
+## 9.6 Loss Reservation and Realization
 
-During default, principal loss reduces tranche NAV through `writeDown()`.
+At `DEFAULTED` finalization, `reserveLoss()` increases `pendingLoss` for the canonical Junior-first waterfall. Gross `accountedAssets`, `lockedAssets`, and raw token balance do not change, but `totalAssets()` and ERC-4626 share price decrease immediately.
 
-LP shares are not burned.
-
-The reduction in `accountedAssets` causes ERC-4626 share price to decline naturally.
+During later default resolution, `writeDown()` decreases both `accountedAssets` and `pendingLoss` by the same amount. This realizes the loss already reflected in NAV without applying a second haircut. LP shares are not burned.
 
 ---
 
@@ -588,6 +608,8 @@ DEFAULTED + recovered principal
 
 The oracle verifies that InvoiceNFT status is `FUNDED`.
 
+For `DEFAULTED`, it also reads the stored principal from `POOL.financingPositions(invoiceId)` and rejects recovery above that principal before writing `StatusUpdate`. It does not use invoice face value or recompute an advance from current Risk Manager configuration.
+
 The update is stored but is not immediately actionable.
 
 ---
@@ -629,6 +651,8 @@ The oracle:
 1. marks the update finalized;
 2. calls the pool callback;
 3. emits the complete outcome and finalization timestamp.
+
+For `SETTLED`, the callback records the outcome without reserving loss. For `DEFAULTED`, the pool independently revalidates recovery against stored financed principal, computes the canonical waterfall from the stored position, records the outcome, and calls `reserveLoss()` on each impaired tranche. This defense-in-depth callback atomically impairs NAV without resolving the position, unlocking principal, reducing Buyer exposure, increasing bad debt, transferring assets, or marking InvoiceNFT terminal.
 
 If the pool callback reverts, the entire transaction reverts, including the oracle's local finalization state.
 
@@ -686,6 +710,8 @@ The pool stores:
 finalizedRecoveryAmount[invoiceId]
 ```
 
+`InvoiceStatusOracle.submitStatus()` rejects recovery above the position's stored financed principal before persisting an active update. `InvoiceFinancingPool.onStatusFinalized()` independently revalidates the same bound as defense in depth.
+
 ---
 
 ## 13.2 H-01 Trust-Boundary Remediation
@@ -730,7 +756,7 @@ juniorRecovery =
 
 ---
 
-## 13.4 Loss Allocation
+## 13.4 Loss Allocation and Reservation
 
 Losses are calculated per tranche:
 
@@ -744,7 +770,9 @@ juniorLoss =
 
 Because recovery is allocated to Senior first, Junior absorbs loss first.
 
-Junior NAV is written down before Senior NAV.
+At `DEFAULTED` finalization, the pool reserves `juniorLoss` and any residual `seniorLoss` through the tranche `reserveLoss()` functions. `pendingLoss` increases and NAV decreases immediately, while the position remains unresolved and locks, Buyer exposure, bad debt, and raw cash remain unchanged.
+
+At later resolution, tranche principal is unlocked and `writeDown()` decreases `accountedAssets` and `pendingLoss` by the same reserved loss. Resolution therefore realizes the loss without a second NAV haircut.
 
 ---
 
@@ -956,7 +984,7 @@ The central security boundary is:
 
 ```text
 Oracle attests economic truth.
-Pool validates and stores it.
+Pool validates and stores it, reserving finalized default impairment.
 Executor supplies assets and triggers deterministic accounting.
 ```
 

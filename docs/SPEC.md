@@ -78,15 +78,13 @@ The oracle reports off-chain economic truth:
 * whether a funded invoice is `SETTLED` or `DEFAULTED`;
 * recovered principal for a `DEFAULTED` outcome.
 
-The oracle does not:
+Oracle finalization does not:
 
 * transfer repayment assets;
-* execute tranche accounting;
-* write down NAV;
 * update buyer exposure;
 * transition InvoiceNFT to a terminal state.
 
-The pool validates and stores the finalized oracle outcome.
+The pool MUST validate and store the finalized oracle outcome. For `DEFAULTED`, the callback MUST also reserve the canonical tranche impairment in `pendingLoss`, immediately affecting NAV without resolving the position. `SETTLED` finalization MUST NOT change `pendingLoss`.
 
 A permissionless executor later supplies the required assets and triggers deterministic settlement or default accounting.
 
@@ -106,9 +104,19 @@ ERC-4626 totalAssets != raw token balance
 
 Each tranche separately tracks:
 
-* `accountedAssets`: tranche NAV;
-* `lockedAssets`: NAV committed to active financing positions;
+* `accountedAssets`: gross accounting assets before reserved default impairment;
+* `lockedAssets`: gross tranche principal committed to unresolved financing positions;
+* `pendingLoss`: finalized but unresolved economic impairment;
 * raw ERC-20 token balance: immediately available cash backing.
+
+The following MUST hold:
+
+```text
+totalAssets() = accountedAssets - pendingLoss
+availableLiquidity() = accountedAssets - lockedAssets
+```
+
+`pendingLoss` MUST NOT be subtracted again from `availableLiquidity()`.
 
 ---
 
@@ -157,7 +165,8 @@ The protocol must preserve the following properties:
 * `totalLockedAssets` must equal unresolved financed principal.
 * Senior and Junior locked assets must be tracked independently.
 * Senior locked assets plus Junior locked assets must equal aggregate locked assets.
-* Tranche locked assets must never exceed tranche NAV.
+* For each tranche, `pendingLoss` must not exceed `lockedAssets`.
+* For each tranche, net unresolved exposure `lockedAssets - pendingLoss` must not exceed `totalAssets()`.
 * Funding must fail if either tranche lacks sufficient available liquidity.
 * LP withdrawals must not consume locked liquidity.
 * Freeze and unfreeze must not change principal, NAV, fee, exposure, or locked-asset accounting.
@@ -536,6 +545,7 @@ It is responsible for:
 * updating Buyer exposure;
 * advancing principal to Suppliers;
 * recording finalized oracle outcomes;
+* reserving canonical default impairment at finalization;
 * executing settlement;
 * executing default recovery and loss allocation;
 * updating aggregate locked assets;
@@ -553,13 +563,18 @@ Both tranche vaults track:
 ```text
 accountedAssets
 lockedAssets
+pendingLoss
 availableLiquidity
 raw token balance
 ```
 
-`accountedAssets` is the ERC-4626 NAV source.
+`accountedAssets` is gross accounting assets before reserved default impairment. `pendingLoss` is finalized but unresolved economic impairment.
 
-`lockedAssets` represents NAV committed to unresolved financed invoices.
+`lockedAssets` represents gross tranche principal committed to unresolved financed invoices.
+
+```solidity
+totalAssets = accountedAssets - pendingLoss;
+```
 
 ```solidity
 availableLiquidity = accountedAssets - lockedAssets;
@@ -567,7 +582,7 @@ availableLiquidity = accountedAssets - lockedAssets;
 
 Financing transfers cash out of the vault but does not immediately reduce NAV because the vault receives economic exposure to the receivable.
 
-Loss is recognized only through an explicit `writeDown()` during default resolution.
+Finalized default loss is reserved through `reserveLoss()` and immediately impairs NAV. `writeDown()` later realizes that same reserved loss during default resolution without applying a second NAV haircut.
 
 ---
 
@@ -688,6 +703,8 @@ InvoiceFinancingPool records the finalized outcome but does not yet:
 * reduce Buyer exposure;
 * mutate `InvoiceNFT` or mark it terminal.
 
+`SETTLED` finalization MUST NOT change tranche `pendingLoss` or impair NAV through loss reservation.
+
 After finalization and before accounting execution, the current `InvoiceNFT` status may be `FUNDED`, or `FROZEN` with `previousStatus` equal to `FUNDED`. If the invoice is `FROZEN`, finalization remains recorded but settlement execution is blocked until unfreeze.
 
 ### Stage 2 — Settlement Accounting Execution
@@ -743,7 +760,10 @@ recoveredAmount = recovered principal
 ### Oracle Recovery Rules
 
 * Recovery may be zero.
-* Recovery must not exceed financed principal.
+* Recovery MUST NOT exceed the principal stored in `POOL.financingPositions(invoiceId)`.
+* The oracle MUST reject excessive recovery before persisting an active `StatusUpdate`.
+* The pool callback MUST independently revalidate the same stored-principal bound as defense in depth.
+* Face value and a freshly recomputed advance under current Risk Manager parameters MUST NOT be used as the bound.
 * Recovery represents principal only.
 * Financing-fee recovery during default is outside v1 scope.
 
@@ -754,11 +774,14 @@ A permissionless caller finalizes the update.
 InvoiceFinancingPool records:
 
 * finalized `DEFAULTED` status;
-* finalized recovered principal.
+* finalized recovered principal;
+* the canonical Junior and Senior losses computed from the stored financing position.
 
 The callback requires an existing financing position.
 
-Finalization does not change `InvoiceNFT` status or mark it terminal. After finalization and before accounting execution, the current status may be `FUNDED`, or `FROZEN` with `previousStatus` equal to `FUNDED`. If the invoice is `FROZEN`, finalization remains recorded but default execution is blocked until unfreeze.
+Finalized loss reservation MUST occur atomically with outcome handling. The pool MUST call `reserveLoss()` for each non-zero tranche loss, increasing `pendingLoss` and reducing `totalAssets()` immediately. Finalization MUST NOT change `accountedAssets`, `lockedAssets`, raw tranche cash, Buyer exposure, `totalBadDebt`, position resolution, or InvoiceNFT status.
+
+After finalization and before accounting execution, the current status may be `FUNDED`, or `FROZEN` with `previousStatus` equal to `FUNDED`. If the invoice is `FROZEN`, the impairment is still reserved, but default resolution is blocked until unfreeze.
 
 ### Stage 2 — Default Accounting Execution
 
@@ -795,12 +818,12 @@ The pool:
 9. increases cumulative bad debt;
 10. transfers recovered assets to the tranche vaults;
 11. unlocks Senior and Junior principal;
-12. writes down Junior NAV first;
-13. writes down Senior NAV for residual loss;
+12. realizes the already reserved Junior loss through `writeDown()`;
+13. realizes the already reserved Senior residual loss through `writeDown()`;
 14. decreases Buyer exposure;
 15. marks InvoiceNFT as `DEFAULTED`.
 
-The executor cannot change the recovery amount.
+The executor cannot change the recovery amount. Each `writeDown()` MUST decrease `accountedAssets` and `pendingLoss` by the same amount so resolution does not apply a second NAV haircut.
 
 ---
 
@@ -818,7 +841,7 @@ When frozen:
 * current status becomes `FROZEN`;
 * prior status is stored in `previousStatus`;
 * no principal changes;
-* no NAV changes;
+* freeze itself makes no NAV change;
 * no fee is realized;
 * no Buyer exposure changes;
 * no locked assets are released;
@@ -826,7 +849,7 @@ When frozen:
 * settlement execution is blocked;
 * default execution is blocked.
 
-An oracle update submitted before the freeze may still be finalized because oracle finalization does not execute accounting or mutate InvoiceNFT.
+An oracle update submitted before the freeze may still be finalized. A finalized `DEFAULTED` update MUST reserve impairment in `pendingLoss` and may therefore reduce NAV while frozen, even though freeze itself is accounting-neutral and InvoiceNFT remains unchanged.
 
 Accounting execution remains blocked until unfreeze.
 
@@ -1025,6 +1048,8 @@ The following must hold:
 juniorFee + seniorFee == financingFee;
 ```
 
+Each realized tranche fee MUST be credited as a lump-sum `creditAssets()` increase. Fee value accrues pro rata to shareholders existing when that credit occurs. v1 MUST NOT be interpreted as snapshotting financing-time shareholders or weighting fee entitlement by holding duration; an LP that enters shortly before settlement may participate in the credited fee.
+
 ---
 
 ## 8.4 Default Treatment
@@ -1088,7 +1113,9 @@ For `DEFAULTED`:
 0 <= recoveredAmount <= financedPrincipal
 ```
 
-The upper principal bound is validated by InvoiceFinancingPool when the oracle callback is finalized.
+`financedPrincipal` MUST be the principal field stored in `POOL.financingPositions(invoiceId)`, not invoice face value and not a new advance calculated from current Risk Manager configuration.
+
+`InvoiceStatusOracle.submitStatus()` MUST validate this bound before persisting the active update. If recovery exceeds stored principal, submission MUST revert without modifying `StatusUpdate` state.
 
 ---
 
@@ -1138,6 +1165,8 @@ Finalization:
 2. calls `InvoiceFinancingPool.onStatusFinalized(...)`;
 3. emits the finalized outcome and finalization timestamp.
 
+For `SETTLED`, the callback MUST NOT reserve loss. For `DEFAULTED`, the callback MUST compute the canonical waterfall from the stored financing position and reserve non-zero tranche losses atomically with finalized outcome handling.
+
 If the pool callback reverts, the entire transaction reverts, including the oracle's local `finalized` update.
 
 ---
@@ -1154,7 +1183,7 @@ InvoiceFinancingPool independently validates:
 * `SETTLED` recovery equals zero;
 * `DEFAULTED` recovery does not exceed stored principal.
 
-The finalized status and recovery then become immutable pool state.
+The callback's recovery check MUST be independent of the oracle submission check and serves as defense in depth. The finalized status and recovery then become immutable pool state. A `DEFAULTED` callback also reserves its canonical impairment before returning successfully.
 
 ---
 
@@ -1292,18 +1321,28 @@ Recovered cash restores token backing for NAV that was already accounted.
 
 Recovery does not independently increase NAV.
 
-Losses reduce NAV through:
+At `DEFAULTED` finalization, canonical tranche losses MUST reduce NAV through:
+
+```solidity
+reserveLoss(lossAmount)
+```
+
+This increases `pendingLoss` without changing `accountedAssets`, `lockedAssets`, or raw tranche cash.
+
+At later resolution, the same loss MUST be realized through:
 
 ```solidity
 writeDown(lossAmount)
 ```
 
-Write-down order:
+`writeDown()` MUST decrease `accountedAssets` and `pendingLoss` by the same amount. It MUST NOT cause a second NAV decrease.
+
+Reservation and realization order:
 
 1. Junior loss;
 2. Senior residual loss.
 
-LP shares are not burned. The NAV decrease is reflected through ERC-4626 share price.
+LP shares are not burned. The NAV decrease is reflected through ERC-4626 share price at default finalization.
 
 ---
 
@@ -1311,20 +1350,26 @@ LP shares are not burned. The NAV decrease is reflected through ERC-4626 share p
 
 ## 12.1 Accounted Assets
 
-Each tranche overrides `totalAssets()` to return internal `accountedAssets`.
+Each tranche stores `accountedAssets` as gross accounting assets before reserved default impairment and overrides `totalAssets()` as:
 
-This represents:
+```solidity
+totalAssets() = accountedAssets - pendingLoss;
+```
+
+Gross `accountedAssets` represents:
 
 * free cash;
 * active receivable exposure;
 * realized fee income;
-* minus realized writedowns.
+* minus realized write-downs.
+
+`pendingLoss` represents finalized but unresolved economic impairment.
 
 ---
 
 ## 12.2 Locked Assets
 
-Funding increases locked assets without reducing NAV.
+`lockedAssets` is gross tranche principal committed to unresolved financings. Funding increases locked assets without reducing NAV.
 
 ```solidity
 lockedAssets += tranchePrincipal;
@@ -1344,6 +1389,8 @@ lockedAssets -= tranchePrincipal;
 availableLiquidity =
     accountedAssets - lockedAssets;
 ```
+
+`pendingLoss` MUST NOT be subtracted again. Available liquidity is based on gross accounting assets and gross unresolved locks.
 
 This value limits:
 
@@ -1381,11 +1428,15 @@ Before NAV increases, the tranche verifies that the corresponding cash backing e
 
 Principal must not be credited twice.
 
+The increase is instantaneous and shared pro rata by ERC-4626 shareholders at credit time. v1 has no financing-time snapshot or duration-weighted fee-reward subsystem.
+
 ---
 
-## 12.7 Write-Down
+## 12.7 Loss Reservation and Write-Down
 
-`writeDown()` decreases `accountedAssets` without burning LP shares.
+`reserveLoss()` increases `pendingLoss` without changing `accountedAssets`, `lockedAssets`, raw token balance, or LP share supply. It MUST be called for each non-zero canonical tranche loss during `DEFAULTED` finalization.
+
+`writeDown()` decreases both `accountedAssets` and `pendingLoss` by the same amount without burning LP shares. It realizes an already reserved impairment and MUST NOT apply a second NAV haircut.
 
 The corresponding locked position must first be unlocked.
 
@@ -1412,8 +1463,13 @@ This is an inherent property of the asset class.
 The following must hold:
 
 ```solidity
-seniorLockedAssets <= seniorTotalAssets;
-juniorLockedAssets <= juniorTotalAssets;
+seniorPendingLoss <= seniorLockedAssets;
+juniorPendingLoss <= juniorLockedAssets;
+```
+
+```solidity
+seniorLockedAssets - seniorPendingLoss <= seniorTotalAssets;
+juniorLockedAssets - juniorPendingLoss <= juniorTotalAssets;
 ```
 
 ```solidity
@@ -1423,12 +1479,12 @@ totalLockedAssets =
 
 ```solidity
 seniorAvailableLiquidity =
-    seniorTotalAssets - seniorLockedAssets;
+    seniorAccountedAssets - seniorLockedAssets;
 ```
 
 ```solidity
 juniorAvailableLiquidity =
-    juniorTotalAssets - juniorLockedAssets;
+    juniorAccountedAssets - juniorLockedAssets;
 ```
 
 Funding fails if either tranche cannot satisfy its required principal contribution.

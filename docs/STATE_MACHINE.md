@@ -14,9 +14,7 @@ A third layer, `InvoiceFinancingPool.sol`, connects them by:
 * executing settlement or default accounting;
 * applying terminal InvoiceNFT transitions.
 
-Oracle finalization is not the same as invoice resolution.
-
-A finalized oracle outcome records off-chain truth, while settlement or default execution applies the corresponding on-chain accounting effects.
+Oracle finalization is not the same as invoice resolution. `SETTLED` finalization records off-chain truth without tranche impairment. `DEFAULTED` finalization also reserves the canonical loss in tranche `pendingLoss`, immediately affecting NAV while leaving the position unresolved. Settlement or default execution later completes the remaining accounting and terminal lifecycle effects.
 
 ---
 
@@ -319,7 +317,7 @@ The same invoice cannot be funded again.
 
 The Supplier has received principal.
 
-Senior and Junior capital remain part of tranche NAV but are marked as locked.
+Senior and Junior gross principal is marked as locked. Tranche NAV includes that receivable exposure net of any `pendingLoss` reserved by a finalized default outcome.
 
 Buyer exposure remains active.
 
@@ -488,10 +486,10 @@ For default:
 
 ```text
 newStatus = DEFAULTED
-recoveredAmount >= 0
+0 <= recoveredAmount <= stored financed principal
 ```
 
-The upper principal boundary is validated by the pool callback during finalization.
+The principal is read from `POOL.financingPositions(invoiceId)`. It is not invoice face value or a freshly recomputed advance. The oracle rejects an excessive recovery before persisting the active update; the pool callback independently revalidates the same bound as defense in depth.
 
 ## Active Update Guard
 
@@ -643,6 +641,11 @@ The oracle:
 2. calls `InvoiceFinancingPool.onStatusFinalized(...)`;
 3. emits the finalized outcome and finalization timestamp.
 
+The pool callback has status-specific effects:
+
+* `SETTLED` records status and zero recovery without changing `pendingLoss` or NAV;
+* `DEFAULTED` records status and recovery, computes the canonical waterfall from the stored position, and reserves each non-zero tranche loss in `pendingLoss`, immediately impairing NAV.
+
 ## Atomicity
 
 The local oracle update is marked finalized before the pool callback.
@@ -700,14 +703,16 @@ These values are immutable after finalization.
 
 ## Important Separation
 
-Pool oracle finalization does not:
+For either outcome, pool oracle finalization does not:
 
 * mark the financing position resolved;
 * release locked capital;
 * decrease Buyer exposure;
-* modify tranche NAV;
 * transfer assets;
+* increase `totalBadDebt`;
 * mark InvoiceNFT terminal.
+
+`SETTLED` finalization does not change tranche `pendingLoss` or NAV. `DEFAULTED` finalization additionally reserves its canonical Junior and Senior losses through `reserveLoss()`. This increases `pendingLoss` and reduces `totalAssets()` without changing `accountedAssets`, locks, or raw cash.
 
 After finalization and before accounting execution, the current `InvoiceNFT` status may be `FUNDED`, or `FROZEN` with `previousStatus` equal to `FUNDED`. Finalization does not change `InvoiceNFT` status or mark it terminal.
 
@@ -726,6 +731,7 @@ InvoiceNFT.status == FUNDED
 position.resolved == false
 finalizedOracleStatus == SETTLED
 finalizedRecoveryAmount == 0
+tranche pendingLoss unchanged by this finalization
 ```
 
 The position is ready for paid-path execution only while the current `InvoiceNFT` status is `FUNDED`. If the invoice is `FROZEN`, finalization remains recorded but execution is blocked until unfreeze.
@@ -826,9 +832,11 @@ InvoiceNFT.status == FUNDED
 position.resolved == false
 finalizedOracleStatus == DEFAULTED
 finalizedRecoveryAmount <= principal
+Senior pendingLoss increased by canonical seniorLoss, if non-zero
+Junior pendingLoss increased by canonical juniorLoss, if non-zero
 ```
 
-The position is ready for default execution only while the current `InvoiceNFT` status is `FUNDED`. If the invoice is `FROZEN`, finalization remains recorded but execution is blocked until unfreeze.
+The NAV impairment is already reflected even though the position remains unresolved. Locks, Buyer exposure, `totalBadDebt`, gross `accountedAssets`, and raw tranche cash are unchanged at this stage. The position is ready for default execution only while the current `InvoiceNFT` status is `FUNDED`. If the invoice is `FROZEN`, finalization and impairment remain recorded but execution is blocked until unfreeze.
 
 ## Allowed Execution
 
@@ -917,8 +925,8 @@ The pool:
 5. transfers Junior recovery;
 6. unlocks Senior principal;
 7. unlocks Junior principal;
-8. writes down Junior loss;
-9. writes down Senior residual loss;
+8. realizes the already reserved Junior loss through `writeDown()`;
+9. realizes the already reserved Senior residual loss through `writeDown()`;
 10. decreases Buyer exposure;
 11. marks InvoiceNFT `DEFAULTED`.
 
@@ -932,6 +940,9 @@ Buyer exposure decreased by principal
 Senior lockedAssets decreased by seniorPrincipal
 Junior lockedAssets decreased by juniorPrincipal
 totalBadDebt increased by principal - finalizedRecoveryAmount
+pendingLoss decreased by each realized tranche loss
+accountedAssets decreased by the same amounts
+totalAssets receives no second loss haircut
 ```
 
 ## Terminal Property
@@ -1050,6 +1061,8 @@ The following remain unchanged:
 * tranche NAV;
 * finalized oracle outcome.
 
+These statements describe the `freezeInvoice()` transition itself. A later `DEFAULTED` finalization may still reserve impairment while the invoice remains frozen.
+
 ## Consequence
 
 Settlement and default execution are blocked.
@@ -1074,7 +1087,7 @@ The existing update may still:
 * become stale;
 * be finalized.
 
-Oracle finalization is allowed because it does not execute accounting or mutate InvoiceNFT.
+Oracle finalization is allowed because it does not economically resolve the position or mutate InvoiceNFT. `SETTLED` finalization has no loss-reservation effect. `DEFAULTED` finalization still reserves the canonical tranche loss in `pendingLoss` and immediately impairs NAV while frozen.
 
 ## Execution While Frozen
 
@@ -1203,7 +1216,7 @@ InvoiceNFT.status == FUNDED
 position.resolved == false
 ```
 
-An unresolved `FROZEN` position is not executable. Execution becomes possible only after unfreeze restores `FUNDED`. Freeze and unfreeze do not change financing-position, Buyer-exposure, locked-liquidity, or tranche accounting.
+An unresolved `FROZEN` position is not executable. Execution becomes possible only after unfreeze restores `FUNDED`. Freeze and unfreeze themselves do not change financing-position, Buyer-exposure, locked-liquidity, or tranche accounting. A `DEFAULTED` finalization between those transitions may nevertheless reserve `pendingLoss` and impair NAV.
 
 After settlement:
 
@@ -1292,6 +1305,14 @@ finalizedRecoveryAmount > position.principal
 ```
 
 ```text
+tranche.pendingLoss > tranche.lockedAssets
+```
+
+```text
+tranche.lockedAssets - tranche.pendingLoss > tranche.totalAssets()
+```
+
+```text
 position.resolved == true
 totalLockedAssets still includes position.principal
 ```
@@ -1305,14 +1326,16 @@ previousStatus not in {VERIFIED, FUNDED}
 
 # 31. Accounting Transition Summary
 
-| Transition           |          Locked Assets |         Buyer Exposure |                Tranche NAV |                    Bad Debt |
-| -------------------- | ---------------------: | ---------------------: | -------------------------: | --------------------------: |
-| `CREATED → VERIFIED` |              unchanged |              unchanged |                  unchanged |                   unchanged |
-| `VERIFIED → FUNDED`  | increases by principal | increases by principal |                  unchanged |                   unchanged |
-| `FUNDED → FROZEN`    |              unchanged |              unchanged |                  unchanged |                   unchanged |
-| `FROZEN → FUNDED`    |              unchanged |              unchanged |                  unchanged |                   unchanged |
-| `FUNDED → SETTLED`   | decreases by principal | decreases by principal |  increases by realized fee |                   unchanged |
-| `FUNDED → DEFAULTED` | decreases by principal | decreases by principal | decreases by realized loss | increases by principal loss |
+| Transition or stage | `accountedAssets` | `pendingLoss` | Locked Assets | Buyer Exposure | Tranche NAV | Bad Debt |
+|---|---:|---:|---:|---:|---:|---:|
+| `CREATED → VERIFIED` | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged |
+| `VERIFIED → FUNDED` | unchanged | unchanged | increases by principal | increases by principal | unchanged | unchanged |
+| `FUNDED → FROZEN` | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged |
+| `FROZEN → FUNDED` | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged |
+| Oracle `SETTLED` finalization | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged |
+| Oracle `DEFAULTED` finalization | unchanged | increases by canonical loss | unchanged | unchanged | decreases by canonical loss | unchanged |
+| `settleInvoice()` resolution | increases by realized fee | unchanged | decreases by principal | decreases by principal | increases by realized fee | unchanged |
+| `resolveDefault()` resolution | decreases by reserved loss | decreases by same loss | decreases by principal | decreases by principal | no second loss haircut | increases by principal loss |
 
 ---
 
@@ -1325,7 +1348,8 @@ previousStatus not in {VERIFIED, FUNDED}
 | `ACTIVE → STALE`     | maximum staleness exceeded             | none                             |
 | `DISPUTED → ACTIVE`  | replacement submission                 | none                             |
 | `STALE → ACTIVE`     | replacement submission                 | none                             |
-| `ACTIVE → FINALIZED` | at or after `submittedAt + DISPUTE_WINDOW`; at or before `submittedAt + MAX_STALENESS` | pool records status and recovery |
+| `ACTIVE → FINALIZED` (`SETTLED`) | at or after `submittedAt + DISPUTE_WINDOW`; at or before `submittedAt + MAX_STALENESS` | records status and zero recovery; no impairment |
+| `ACTIVE → FINALIZED` (`DEFAULTED`) | same timing bounds; recovery no greater than stored financed principal | records outcome and reserves canonical tranche loss |
 | `FINALIZED → any`    | forbidden                              | none                             |
 
 ---
@@ -1344,16 +1368,18 @@ Examples include:
 * invalid lifecycle state;
 * tranche accounting failure.
 
-Because all operations occur atomically, a failed settlement or default execution must not partially change:
+Because all operations occur atomically, a failed settlement or default execution must not cause any further change to:
 
 * `resolved`;
 * aggregate locked assets;
 * total bad debt;
 * Buyer exposure;
 * tranche locked assets;
-* tranche NAV;
+* tranche `accountedAssets`, `pendingLoss`, or NAV;
 * InvoiceNFT status;
 * token balances.
+
+For a failed default resolution after successful `DEFAULTED` finalization, the already reserved `pendingLoss` and NAV impairment remain in place; they are not effects of the reverted resolution call.
 
 ---
 
@@ -1365,7 +1391,7 @@ The state machine must guarantee:
 * funding occurs at most once;
 * terminal outcomes are immutable;
 * execution occurs at most once;
-* oracle finalization and accounting execution are separate;
+* oracle finalization and economic resolution are separate, while `DEFAULTED` finalization reserves impairment;
 * off-chain truth is controlled only by the oracle boundary;
 * accounting truth is controlled only by the pool;
 * executors cannot select recovery;
@@ -1401,8 +1427,8 @@ InvoiceFinancingPool
 The central state-machine boundary is:
 
 ```text
-Oracle finalization records truth.
-Pool execution applies accounting.
+Oracle finalization records truth and reserves finalized default impairment.
+Pool execution completes settlement or realizes the already reserved default loss.
 InvoiceNFT records the completed lifecycle transition.
 ```
 

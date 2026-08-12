@@ -352,21 +352,28 @@ A stale pending outcome may be replaced passively if time advanced through other
 - **Catches:** Incorrect production allocation, rounding-remainder errors, and corrupt stored position terms.
 - **Assumptions:** Junior receives the modelled rounding remainder.
 
-### 10.5 `invariant_TrancheLocksNeverExceedTrancheNav`
+### 10.5 `invariant_TrancheNetExposureNeverExceedsTrancheNav`
 
 - **Classification:** Direct protocol bound.
 - **Property:**
 
   ```text
-  seniorPool.lockedAssets() <= seniorPool.totalAssets()
-  juniorPool.lockedAssets() <= juniorPool.totalAssets()
+  seniorPool.pendingLoss() <= seniorPool.lockedAssets()
+  seniorPool.lockedAssets() - seniorPool.pendingLoss()
+      <= seniorPool.totalAssets()
+
+  juniorPool.pendingLoss() <= juniorPool.lockedAssets()
+  juniorPool.lockedAssets() - juniorPool.pendingLoss()
+      <= juniorPool.totalAssets()
   ```
 
 - **Expected source:** The bound itself; no ghost reconstruction.
-- **Actual state:** Each vault’s locked assets and NAV.
+- **Actual state:** Each vault’s pending loss, locked assets, and impairment-adjusted NAV.
 - **Ghost dependency:** None.
-- **Catches:** Over-locking and NAV reductions below outstanding locked exposure.
-- **Assumptions:** Vault NAV represents cash plus active receivable exposure.
+- **Catches:** Reserved impairment above gross unresolved principal and net unresolved exposure above tranche NAV.
+- **Assumptions:** `totalAssets() = accountedAssets - pendingLoss` and `lockedAssets` remains the gross principal of unresolved positions.
+
+Gross locked principal may exceed impairment-adjusted NAV after a default is finalized because `pendingLoss` reduces NAV before resolution releases the gross lock. The relevant safety object is net unresolved exposure, `lockedAssets - pendingLoss`, not gross `lockedAssets` in isolation.
 
 ### 10.6 `invariant_PositionResolutionMatchesInvoiceLifecycle`
 
@@ -477,13 +484,14 @@ asset.balanceOf(address(JuniorPool))
 
 The relationship is preserved as follows:
 
-1. **Initial deposits:** Token cash and accounted NAV increase by the same amount; locks remain zero.
+1. **Initial deposits:** Token cash and `accountedAssets` increase by the same amount; with no reserved impairment, `totalAssets()` increases by the same amount and locks remain zero.
 2. **Invoice financing:** Locking preserves NAV but reduces available liquidity. Funding transfers exactly the locked principal out of each vault, reducing cash by the same amount.
-3. **Settlement principal:** Principal cash returns to each vault before the corresponding lock is released.
-4. **Settlement fee:** Fee cash arrives before `creditAssets` increases accounted NAV.
-5. **Default recovery:** Recovered principal is transferred to the applicable vault.
-6. **Unlock:** Releasing the full principal allocation increases accounting availability.
-7. **Write-down:** Unrecovered principal reduces NAV, bringing available liquidity back into equality with actual cash.
+3. **Default finalization:** `reserveLoss` increases `pendingLoss` and reduces `totalAssets()` without changing `accountedAssets`, `lockedAssets`, available liquidity, or cash.
+4. **Settlement principal:** Principal cash returns to each vault before the corresponding lock is released.
+5. **Settlement fee:** Fee cash arrives before `creditAssets` increases `accountedAssets` and therefore increases `totalAssets()` by the credited fee.
+6. **Default recovery:** Recovered principal is transferred to the applicable vault.
+7. **Unlock:** Releasing the full principal allocation increases accounting availability.
+8. **Write-down:** Realizing unrecovered principal decreases `accountedAssets` and `pendingLoss` by the same amount, preserving the NAV haircut already reflected at finalization and bringing available liquidity back into equality with actual cash.
 
 Exact equality assumes:
 
@@ -559,7 +567,7 @@ pendingSubmittedAt + maxStaleness
 
 and returns early after that boundary.
 
-The handler does not require NFT status `FUNDED` during finalization. An outcome may therefore finalize while the invoice is `FROZEN`. Settlement or default execution remains blocked until unfreeze restores `FUNDED`.
+The handler does not require NFT status `FUNDED` during finalization. An outcome may therefore finalize while the invoice is `FROZEN`. A finalized `DEFAULTED` outcome reserves its canonical `pendingLoss` and impairs NAV in that state; settlement or default execution remains blocked until unfreeze restores `FUNDED`.
 
 The stateful handler does not:
 
@@ -580,7 +588,9 @@ Passive stale replacement can still occur when time advances through other final
 - Default recovery is allocated Senior-first by production accounting.
 - Junior absorbs first loss; Senior absorbs residual loss.
 - Freeze and unfreeze are accounting-neutral.
-- Finalization records an outcome but does not execute economic accounting.
+- `SETTLED` finalization does not reserve impairment.
+- `DEFAULTED` finalization reserves canonical tranche impairment without resolving the position.
+- Default resolution realizes the reserved loss without a second NAV haircut.
 - The handler’s bounded arithmetic is safe only for validated model limits.
 
 ## 15. Covered State Space
@@ -615,7 +625,7 @@ The stateful suite covers arbitrary sequences involving:
 |---|---|
 | Oracle disputes | Excluded from the handler; covered by unit and integration tests |
 | Deliberate stale replacement sequences | No targeted handler action; replacement behavior is covered by unit tests, while passive stale resubmission may occur statefully |
-| Dynamic LP deposits and withdrawals | Initial deposits only in the stateful fixture; lifecycle withdrawals are covered by integration tests |
+| Dynamic LP deposits and withdrawals | Not handler actions; LPs deposit only during fixture setup, while lifecycle withdrawals are covered by deterministic integration tests |
 | Direct token donations | Excluded and not comprehensively covered by the stateful suite; optional future extension |
 | ERC-4626 donation/share-price manipulation | Outside this handler; documented as a risk and suitable for dedicated vault tests |
 | Fee-on-transfer tokens | Not applicable to `MockERC20`; unsupported by the cash-equality assumption |
@@ -626,12 +636,16 @@ The stateful suite covers arbitrary sequences involving:
 | Arbitrary external vault transfers | Excluded; would require tracked surplus or a weaker cash-backing property |
 | Invalid small-principal financing | No longer a valid protocol action after the zero-tranche guard; constructor and financing regression tests cover it |
 
+The V06-01 LP-timing exploit regression is covered outside the stateful handler by dedicated deterministic and integration tests for finalized-default NAV impairment and LP entry/exit timing. The stateful suite does not claim dynamic LP timing coverage.
+
+V06-02 just-in-time settlement-fee participation is not claimed as a stateful invariant. Because dynamic LP entry is outside this handler state space, the suite neither prevents nor evaluates an LP entering shortly before settlement and sharing pro rata in the fee credited at that time.
+
 ## 17. Known Limitations
 
 - `ModelConfig` must change whenever production economics intentionally change.
 - Mirroring the same conceptual formula in production and the ghost model cannot detect a shared specification error.
 - Only two Buyers and one Supplier are modelled.
-- Dynamic LP operations and donations are not handler actions.
+- Dynamic LP deposits, withdrawals, and donations are not handler actions.
 - `financingFee` is independently reconstructed for settlement execution but is not stored in `GhostPosition`.
 - The canonical-position invariant checks identity, principal split, timestamps, and resolution but intentionally ignores stored `financingFee`.
 - Primitive advance and fee mathematics are covered separately by unit and fuzz tests.
@@ -667,7 +681,7 @@ Early-returning handler calls still consume configured action slots. With `fail_
 
 ## 19. Latest Verified Result
 
-### Local state after configuration commit `9c08419`
+### Current validated state
 
 Stateful invariant verification completed with:
 
@@ -679,16 +693,14 @@ Stateful invariant verification completed with:
 0 discards
 ```
 
-The invariant-suite runtime was approximately 16 minutes 12 seconds.
-
 The complete local suite contained:
 
 ```text
-210 regular unit, integration, and fuzz tests
+217 regular unit, integration, and fuzz tests
 12 stateful invariant tests
-222 total tests
+229 total tests
 
-222 passed
+229 passed
 0 failed
 0 skipped
 ```
