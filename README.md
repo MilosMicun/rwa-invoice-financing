@@ -399,6 +399,8 @@ No deployment command is documented because the deployment script and public dep
 
 - [`docs/RISKS.md`](docs/RISKS.md) records known risks, mitigations, test evidence, and intentionally deferred work.
 
+- [`docs/SELF_AUDIT.md`](docs/SELF_AUDIT.md) records the evidence-backed internal security review, finding dispositions, remediation evidence, and assurance boundaries.
+
 The README provides orientation; these documents contain the detailed protocol behavior and limitations.
 
 ## 12. Deployment and Development Status
