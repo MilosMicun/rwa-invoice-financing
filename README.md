@@ -4,7 +4,22 @@
 
 This repository implements a Solidity reference protocol for financing verified invoices through separate Senior and Junior `ERC-4626` liquidity tranches. Each invoice is represented by a non-transferable `ERC-721` claim with an explicit lifecycle. Only the recorded Supplier may request financing, and each request is subject to invoice eligibility, Buyer denylist checks, active-principal concentration limits, and available tranche liquidity. Off-chain settlement or default outcomes enter through a permissioned, disputable oracle with bounded finalization timing. Finalization records the protocol's attestation without economically resolving the position; a finalized `DEFAULTED` outcome nevertheless reserves its canonical tranche impairment in NAV immediately. Permissionless execution later supplies the required assets and completes settlement or default accounting.
 
-> **Status:** This is a locally verified portfolio/reference implementation. An independent external security review has been completed and its findings dispositioned, but this is not a formal production audit or formal verification. The protocol is not publicly deployed and is not represented as production-ready.
+> **Status:** This is a portfolio/reference implementation with a public Ethereum Sepolia deployment. An independent external security review has been completed and its findings dispositioned, but this is not a formal production audit or formal verification. The protocol is not represented as production-ready.
+
+## Live Sepolia Deployment
+
+The protocol is deployed on Ethereum Sepolia (chain ID `11155111`). All six protocol contracts are source-verified on Sepolia Etherscan.
+
+| Contract | Verified deployment |
+|---|---|
+| `InvoiceNFT` | [`0xc00Bd076a831C8716B63bbA1De1B374c5C120A59`](https://sepolia.etherscan.io/address/0xc00Bd076a831C8716B63bbA1De1B374c5C120A59) |
+| `RWARiskManager` | [`0x7b26D9C8441b1573FA780776400399ef846D5267`](https://sepolia.etherscan.io/address/0x7b26D9C8441b1573FA780776400399ef846D5267) |
+| `InvoiceFinancingPool` | [`0x28ebbBF765bAA41B40A32E2d398897acf1b31136`](https://sepolia.etherscan.io/address/0x28ebbBF765bAA41B40A32E2d398897acf1b31136) |
+| `SeniorPool` | [`0x1b4F190a6e41d652324F42a3e952E42000C2Da2C`](https://sepolia.etherscan.io/address/0x1b4F190a6e41d652324F42a3e952E42000C2Da2C) |
+| `JuniorPool` | [`0xCfBFB78f7466CC39a0c7d11E433226318d399b2E`](https://sepolia.etherscan.io/address/0xCfBFB78f7466CC39a0c7d11E433226318d399b2E) |
+| `InvoiceStatusOracle` | [`0x99Da04B576aC19aF6b00294DeA4f96EA2A1bf23b`](https://sepolia.etherscan.io/address/0x99Da04B576aC19aF6b00294DeA4f96EA2A1bf23b) |
+
+Post-deployment checks passed for live wiring, economic configuration, role separation, bootstrap revocations, and initial accounting. See the canonical [`Sepolia deployment record`](docs/DEPLOYMENT.md) for deployment metadata, permissions, acceptance evidence, and trust boundaries.
 
 ## 2. Design Highlights
 
@@ -339,6 +354,7 @@ Latest local stateful verification completed with:
 │   ├── ARCHITECTURE.md
 │   ├── STATE_MACHINE.md
 │   ├── INVARIANTS.md
+│   ├── DEPLOYMENT.md
 │   └── RISKS.md
 ├── script/
 │   └── Deploy.s.sol
@@ -346,13 +362,13 @@ Latest local stateful verification completed with:
 └── remappings.txt
 ```
 
-`script/Deploy.s.sol` is currently a placeholder. Deployment automation and environment-specific configuration remain planned work.
+`script/Deploy.s.sol` contains the Sepolia deployment and acceptance-validation workflow. The resulting public testnet deployment is recorded in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## 10. Build and Test
 
 ### Prerequisites
 
-Install [Foundry](https://book.getfoundry.sh/getting-started/installation) and Git. Source files declare `pragma solidity ^0.8.24`; `foundry.toml` does not explicitly pin a separate `solc` version. OpenZeppelin Contracts is pinned at `v5.6.1`.
+Install [Foundry](https://book.getfoundry.sh/getting-started/installation) and Git. Source files declare `pragma solidity ^0.8.24`; `foundry.toml` pins Solc `0.8.33`. OpenZeppelin Contracts is pinned at `v5.6.1`.
 
 ### Install Dependencies
 
@@ -385,7 +401,7 @@ forge fmt --check
 git diff --check
 ```
 
-No deployment command is documented because the deployment script and public deployment configuration are not yet complete.
+Deployment metadata and the resulting live addresses are documented in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## 11. Documentation
 
@@ -401,22 +417,13 @@ No deployment command is documented because the deployment script and public dep
 
 - [`docs/SELF_AUDIT.md`](docs/SELF_AUDIT.md) records the evidence-backed internal security review, finding dispositions, remediation evidence, and assurance boundaries.
 
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) is the canonical record of the public Sepolia deployment, permission model, verification, and post-deployment acceptance checks.
+
 The README provides orientation; these documents contain the detailed protocol behavior and limitations.
 
 ## 12. Deployment and Development Status
 
-The core contracts, interfaces, test suites, and protocol documentation are implemented. The latest recorded local full-suite verification reports `229` tests passed, `0` failed, and `0` skipped across the unit, integration, fuzz, and invariant layers.
-
-The next planned phase includes:
-
-- completing deployment automation;
-- defining environment-specific constructor and role configuration;
-- deploying to a public testnet;
-- publishing contract addresses and role assignments;
-- adding post-deployment verification and operational checks;
-- reassessing the documented risk model against the selected asset and deployment parameters.
-
-The repository does not currently provide evidence of an active testnet or mainnet deployment. Test fixture parameters such as the `80%` advance rate, `70/30` funding allocation, and `40/60` fee participation must not be interpreted as deployed settings.
+The core contracts, interfaces, test suites, protocol documentation, and Sepolia deployment workflow are implemented. The latest recorded full-suite verification reports `229` tests passed, `0` failed, and `0` skipped across the unit, integration, fuzz, and invariant layers. The public Sepolia deployment, its demonstration parameters, and its separately checked live state are documented in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). No mainnet or production deployment is represented.
 
 ## 13. Scope, Limitations, and Disclaimer
 
@@ -425,7 +432,7 @@ This repository is an educational and portfolio-oriented reference implementatio
 Important limitations include:
 
 - an independent external security review is complete, but no formal production audit or formal verification has been performed;
-- no public testnet or mainnet deployment;
+- no mainnet or production deployment;
 - no decentralized or cryptographically verified source of invoice outcomes;
 - no claim that every valid deployment configuration has been tested;
 - no established support for fee-on-transfer, rebasing, callback-enabled, or other non-standard ERC-20 assets;
@@ -433,7 +440,7 @@ Important limitations include:
 - no duration-weighted fee entitlement; LPs entering shortly before settlement may participate pro rata in the realized fee credited at settlement;
 - no on-chain legal enforcement of invoice obligations;
 - no integrated identity, KYC, AML, sanctions, document-authenticity, custody, or fiat-payment system;
-- no completed deployment governance, monitoring, emergency-response, or key-management framework.
+- no production governance, monitoring, emergency-response, or key-management framework; the Sepolia portfolio deployment uses permissioned EOAs with separated operational responsibilities.
 
 Junior first-loss protection reduces Senior loss only up to the funded Junior allocation. Oracle permissions, administrative roles, Buyer underwriting, real-world invoice validity, and recovery operations remain material trust assumptions.
 
