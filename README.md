@@ -21,6 +21,8 @@ The protocol is deployed on Ethereum Sepolia (chain ID `11155111`). All six prot
 
 Post-deployment checks passed for live wiring, economic configuration, role separation, bootstrap revocations, and initial accounting. See the canonical [`Sepolia deployment record`](docs/DEPLOYMENT.md) for deployment metadata, permissions, acceptance evidence, and trust boundaries.
 
+The deployed protocol was subsequently exercised end-to-end through liquidity seeding, invoice origination and verification, financing, oracle settlement and default outcomes, finalization after the real 24-hour dispute window, default resolution, paid settlement, and final accounting inspection. The [`Sepolia live demo record`](docs/LIVE_DEMO.md) documents the actors, transaction evidence, economic checkpoints, and resulting on-chain state.
+
 ## 2. Design Highlights
 
 - **Explicit invoice lifecycle:** `CREATED`, `VERIFIED`, `FUNDED`, `SETTLED`, and `DEFAULTED` states constrain lifecycle transitions, with `FROZEN` serving as an operational and legal-risk overlay for eligible invoices.

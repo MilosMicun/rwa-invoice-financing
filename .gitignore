@@ -9,3 +9,6 @@ out/
 
 # Dotenv file
 .env
+
+# Live demo execution artifacts
+/broadcast/LiveDemo.s.sol/
